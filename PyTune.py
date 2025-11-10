@@ -282,5 +282,5 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
     player = PyTune()
     player.show()
-
     sys.exit(app.exec())
+
