@@ -27,7 +27,6 @@ class PyTune(QWidget):
 
         self.list_widget = QListWidget()
 
-        # === Кнопки ===
         self.open_btn = QPushButton('Открыть')
         self.delete_btn = QPushButton('Удалить')
         self.play_btn = QPushButton('▶')
@@ -35,7 +34,6 @@ class PyTune(QWidget):
         self.prev_btn = QPushButton('⏮')
         self.next_btn = QPushButton('⏭')
 
-        # === Слайдеры ===
         self.position_slider = QSlider(Qt.Orientation.Horizontal)
         self.position_slider.setRange(0, 0)
 
@@ -46,13 +44,11 @@ class PyTune(QWidget):
 
         self.time_label = QLabel('00:00 / 00:00')
 
-        # === Обложка и подписи ===
         self.cover_label = QLabel()
         self.cover_label.setFixedSize(200, 200)
         self.cover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cover_label.setStyleSheet("border: 1px solid gray;")
 
-        # ↓ создаём подписи ДО вызова set_default_cover()
         self.title_label = QLabel("—")
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.title_label.setStyleSheet("font-weight: bold; font-size: 14px; margin-top: 5px;")
@@ -68,7 +64,6 @@ class PyTune(QWidget):
         cover_layout.addWidget(self.title_label)
         cover_layout.addWidget(self.artist_label)
 
-        # === Панель управления ===
         controls_layout = QHBoxLayout()
         controls_layout.addWidget(self.open_btn)
         controls_layout.addWidget(self.delete_btn)
@@ -80,20 +75,17 @@ class PyTune(QWidget):
         controls_layout.addWidget(QLabel('Громкость'))
         controls_layout.addWidget(self.volume_slider)
 
-        # === Левая часть ===
         left_layout = QVBoxLayout()
         left_layout.addWidget(self.list_widget)
         left_layout.addLayout(controls_layout)
         left_layout.addWidget(self.position_slider)
         left_layout.addWidget(self.time_label)
 
-        # === Основной макет ===
         main_layout = QHBoxLayout()
         main_layout.addLayout(left_layout, 3)
         main_layout.addLayout(cover_layout, 1)
         self.setLayout(main_layout)
 
-        # === Сигналы ===
         self.open_btn.clicked.connect(self.open_files)
         self.delete_btn.clicked.connect(self.delete_selected)
         self.play_btn.clicked.connect(self.play_pause)
@@ -290,4 +282,5 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
     player = PyTune()
     player.show()
+
     sys.exit(app.exec())
