@@ -9,6 +9,7 @@ from PyQt6.QtGui import QPixmap
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC, TIT2, TPE1
+import json
 
 
 class PyTune(QWidget):
@@ -105,6 +106,9 @@ class PyTune(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_time_label)
         self.timer.start(500)
+
+        self.load_playlist()
+
 
     def set_default_cover(self):
         pix = QPixmap(200, 200)
@@ -276,6 +280,43 @@ class PyTune(QWidget):
             if self.playlist:
                 self.current_index = (self.current_index + 1) % len(self.playlist)
                 self.play_file(self.playlist[self.current_index])
+
+    def save_playlist(self):
+        data = {
+        "playlist": self.playlist,
+        "current_index": self.current_index
+        }
+        try:
+            with open("playlist.json", "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            print("Ошибка сохранения плейлиста:", e)
+
+
+    def load_playlist(self):
+        if not os.path.exists("playlist.json"):
+            return
+
+        try:
+            with open("playlist.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            self.playlist = data.get("playlist", [])
+            self.current_index = data.get("current_index", -1)
+
+            self.list_widget.clear()
+            for track in self.playlist:
+                self.list_widget.addItem(track)
+
+            if self.playlist and 0 <= self.current_index < len(self.playlist):
+                self.highlight_current()
+                self.update_cover(self.playlist[self.current_index])
+        except Exception as e:
+            print("Ошибка загрузки плейлиста:", e)
+
+    def closeEvent(self, event):
+        self.save_playlist()
+        event.accept()
 
 
 if __name__ == '__main__':
