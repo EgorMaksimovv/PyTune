@@ -10,6 +10,7 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC, TIT2, TPE1
 import json
+import random
 
 
 class PyTune(QWidget):
@@ -17,7 +18,7 @@ class PyTune(QWidget):
         super().__init__()
 
         self.setWindowTitle('PyTune')
-        self.setMinimumSize(700, 600)
+        self.setMinimumSize(1150, 600)
 
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
@@ -25,6 +26,9 @@ class PyTune(QWidget):
 
         self.playlist = []
         self.current_index = -1
+
+        self.shuffle_mode = False
+        self.repeat_mode = 0 
 
         self.list_widget = QListWidget()
 
@@ -34,6 +38,8 @@ class PyTune(QWidget):
         self.stop_btn = QPushButton('■')
         self.prev_btn = QPushButton('⏮')
         self.next_btn = QPushButton('⏭')
+        self.shuffle_btn = QPushButton('🔀')
+        self.repeat_btn = QPushButton('🔁')
 
         self.position_slider = QSlider(Qt.Orientation.Horizontal)
         self.position_slider.setRange(0, 0)
@@ -58,7 +64,7 @@ class PyTune(QWidget):
         self.artist_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.artist_label.setStyleSheet("font-size: 13px; color: gray;")
 
-        self.set_default_cover() 
+        self.set_default_cover()
 
         cover_layout = QVBoxLayout()
         cover_layout.addWidget(self.cover_label)
@@ -72,6 +78,9 @@ class PyTune(QWidget):
         controls_layout.addWidget(self.play_btn)
         controls_layout.addWidget(self.stop_btn)
         controls_layout.addWidget(self.next_btn)
+        controls_layout.addWidget(self.shuffle_btn)
+        controls_layout.addWidget(self.repeat_btn)
+
         controls_layout.addStretch()
         controls_layout.addWidget(QLabel('Громкость'))
         controls_layout.addWidget(self.volume_slider)
@@ -98,6 +107,9 @@ class PyTune(QWidget):
         self.position_slider.sliderMoved.connect(self.seek)
         self.volume_slider.valueChanged.connect(self.change_volume)
 
+        self.shuffle_btn.clicked.connect(self.toggle_shuffle)
+        self.repeat_btn.clicked.connect(self.toggle_repeat)
+
         self.player.positionChanged.connect(self.position_changed)
         self.player.durationChanged.connect(self.duration_changed)
         self.player.playbackStateChanged.connect(self.update_play_button)
@@ -108,7 +120,6 @@ class PyTune(QWidget):
         self.timer.start(500)
 
         self.load_playlist()
-
 
     def set_default_cover(self):
         pix = QPixmap(200, 200)
@@ -146,24 +157,34 @@ class PyTune(QWidget):
 
             self.title_label.setText(title)
             self.artist_label.setText(artist if artist else "")
-        except Exception as e:
-            print(f"Ошибка загрузки обложки или тегов: {e}")
+        except:
             self.set_default_cover()
+
+    def toggle_shuffle(self):
+        self.shuffle_mode = not self.shuffle_mode
+        self.shuffle_btn.setStyleSheet(
+            "background: lightgreen;" if self.shuffle_mode else ""
+        )
+
+    def toggle_repeat(self):
+        self.repeat_mode = (self.repeat_mode + 1) % 3
+
+        if self.repeat_mode == 0:
+            self.repeat_btn.setText("🔁")
+        elif self.repeat_mode == 1:
+            self.repeat_btn.setText("🔂") 
+        else:
+            self.repeat_btn.setText("🔁∞") 
 
     def open_files(self):
         files, _ = QFileDialog.getOpenFileNames(self, 'Открыть MP3-файлы', '', 'MP3 Files (*.mp3)')
         if not files:
             return
 
-        added = 0
         for f in files:
             if f not in self.playlist:
                 self.playlist.append(f)
                 self.list_widget.addItem(f)
-                added += 1
-
-        if added == 0:
-            QMessageBox.information(self, 'Внимание', 'Все выбранные треки уже добавлены.')
 
         if self.current_index == -1 and self.playlist:
             self.current_index = 0
@@ -176,28 +197,19 @@ class PyTune(QWidget):
             return
 
         deleting_current = (row == self.current_index)
+
         self.playlist.pop(row)
         self.list_widget.takeItem(row)
 
         if not self.playlist:
             self.player.stop()
             self.current_index = -1
-            self.position_slider.setRange(0, 0)
-            self.time_label.setText('00:00 / 00:00')
             self.set_default_cover()
             return
 
         if deleting_current:
-            self.player.stop()
-            if row < len(self.playlist):
-                self.current_index = row
-            else:
-                self.current_index = len(self.playlist) - 1
+            self.current_index = min(row, len(self.playlist) - 1)
             self.play_file(self.playlist[self.current_index])
-        elif row < self.current_index:
-            self.current_index -= 1
-
-        self.highlight_current()
 
     def play_file(self, file_path):
         if not file_path:
@@ -218,8 +230,7 @@ class PyTune(QWidget):
             self.player.pause()
         else:
             if self.player.source().isEmpty():
-                if self.current_index < 0 or self.current_index >= len(self.playlist):
-                    self.current_index = 0
+                self.current_index = max(self.current_index, 0)
                 self.play_file(self.playlist[self.current_index])
             else:
                 self.player.play()
@@ -230,16 +241,44 @@ class PyTune(QWidget):
     def prev_track(self):
         if not self.playlist:
             return
+
         if self.player.position() > 2000:
             self.player.setPosition(0)
-        else:
-            self.current_index = (self.current_index - 1) % len(self.playlist)
+            return
+
+        if self.shuffle_mode:
+            self.current_index = random.randrange(len(self.playlist))
             self.play_file(self.playlist[self.current_index])
+            return
+
+        self.current_index = (self.current_index - 1) % len(self.playlist)
+        self.play_file(self.playlist[self.current_index])
 
     def next_track(self):
         if not self.playlist:
             return
-        self.current_index = (self.current_index + 1) % len(self.playlist)
+
+        if self.shuffle_mode:
+            new_index = random.randrange(len(self.playlist))
+            if len(self.playlist) > 1:
+                while new_index == self.current_index:
+                    new_index = random.randrange(len(self.playlist))
+            self.current_index = new_index
+            self.play_file(self.playlist[self.current_index])
+            return
+
+        if self.repeat_mode == 1:
+            self.play_file(self.playlist[self.current_index])
+            return
+
+        self.current_index += 1
+
+        if self.repeat_mode == 0 and self.current_index >= len(self.playlist):
+            self.stop()
+            self.current_index = len(self.playlist) - 1
+            return
+
+        self.current_index %= len(self.playlist)
         self.play_file(self.playlist[self.current_index])
 
     def list_double_clicked(self, item):
@@ -256,11 +295,9 @@ class PyTune(QWidget):
 
     def position_changed(self, pos):
         self.position_slider.setValue(pos)
-        self.update_time_label()
 
     def duration_changed(self, dur):
         self.position_slider.setRange(0, dur)
-        self.update_time_label()
 
     def update_time_label(self):
         pos = int(self.player.position() / 1000)
@@ -277,21 +314,15 @@ class PyTune(QWidget):
 
     def media_status_changed(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
-            if self.playlist:
-                self.current_index = (self.current_index + 1) % len(self.playlist)
-                self.play_file(self.playlist[self.current_index])
+            self.next_track()
 
     def save_playlist(self):
-        data = {
-        "playlist": self.playlist,
-        "current_index": self.current_index
-        }
+        data = {"playlist": self.playlist, "current_index": self.current_index}
         try:
             with open("playlist.json", "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
-        except Exception as e:
-            print("Ошибка сохранения плейлиста:", e)
-
+        except:
+            pass
 
     def load_playlist(self):
         if not os.path.exists("playlist.json"):
@@ -311,8 +342,8 @@ class PyTune(QWidget):
             if self.playlist and 0 <= self.current_index < len(self.playlist):
                 self.highlight_current()
                 self.update_cover(self.playlist[self.current_index])
-        except Exception as e:
-            print("Ошибка загрузки плейлиста:", e)
+        except:
+            pass
 
     def closeEvent(self, event):
         self.save_playlist()
@@ -324,4 +355,3 @@ if __name__ == '__main__':
     player = PyTune()
     player.show()
     sys.exit(app.exec())
-
