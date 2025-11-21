@@ -28,7 +28,7 @@ class PyTune(QWidget):
         self.current_index = -1
 
         self.shuffle_mode = False
-        self.repeat_mode = 0 
+        self.repeat_mode = 0
 
         self.list_widget = QListWidget()
 
@@ -129,55 +129,81 @@ class PyTune(QWidget):
         self.artist_label.setText("")
 
     def update_cover(self, file_path):
+        self.set_default_cover()
+        ext = os.path.splitext(file_path)[1].lower()
+
         try:
-            audio = MP3(file_path, ID3=ID3)
-            title = None
-            artist = None
-            cover_found = False
+            if ext == ".mp3":
+                audio = MP3(file_path, ID3=ID3)
 
-            if audio.tags:
-                for tag in audio.tags.values():
-                    if isinstance(tag, TIT2):
-                        title = str(tag.text[0])
-                    elif isinstance(tag, TPE1):
-                        artist = str(tag.text[0])
-                    elif isinstance(tag, APIC):
-                        pixmap = QPixmap()
-                        pixmap.loadFromData(tag.data)
-                        scaled = pixmap.scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatio,
-                                               Qt.TransformationMode.SmoothTransformation)
-                        self.cover_label.setPixmap(scaled)
-                        cover_found = True
+                title = None
+                artist = None
 
-            if not cover_found:
-                self.set_default_cover()
+                if audio.tags:
+                    for tag in audio.tags.values():
+                        if isinstance(tag, TIT2):
+                            title = str(tag.text[0])
+                        elif isinstance(tag, TPE1):
+                            artist = str(tag.text[0])
+                        elif isinstance(tag, APIC):
+                            pixmap = QPixmap()
+                            pixmap.loadFromData(tag.data)
+                            scaled = pixmap.scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatio,
+                                                   Qt.TransformationMode.SmoothTransformation)
+                            self.cover_label.setPixmap(scaled)
 
-            if not title:
-                title = os.path.basename(file_path)
+                if not title:
+                    title = os.path.basename(file_path)
 
-            self.title_label.setText(title)
-            self.artist_label.setText(artist if artist else "")
+                self.title_label.setText(title)
+                self.artist_label.setText(artist if artist else "")
+                return
+
+            elif ext == ".flac":
+                from mutagen.flac import FLAC
+                audio = FLAC(file_path)
+
+                title = audio.get("title", [os.path.basename(file_path)])[0]
+                artist = audio.get("artist", [""])[0]
+
+                if audio.pictures:
+                    pic = audio.pictures[0]
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(pic.data)
+                    scaled = pixmap.scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatio,
+                                           Qt.TransformationMode.SmoothTransformation)
+                    self.cover_label.setPixmap(scaled)
+
+                self.title_label.setText(title)
+                self.artist_label.setText(artist)
+                return
+
         except:
-            self.set_default_cover()
+            pass
+
+        self.title_label.setText(os.path.basename(file_path))
+        self.artist_label.setText("")
 
     def toggle_shuffle(self):
         self.shuffle_mode = not self.shuffle_mode
-        self.shuffle_btn.setStyleSheet(
-            "background: lightgreen;" if self.shuffle_mode else ""
-        )
+        self.shuffle_btn.setStyleSheet("background: lightgreen;" if self.shuffle_mode else "")
 
     def toggle_repeat(self):
         self.repeat_mode = (self.repeat_mode + 1) % 3
-
         if self.repeat_mode == 0:
             self.repeat_btn.setText("🔁")
         elif self.repeat_mode == 1:
-            self.repeat_btn.setText("🔂") 
+            self.repeat_btn.setText("🔂")
         else:
-            self.repeat_btn.setText("🔁∞") 
+            self.repeat_btn.setText("🔁∞")
 
     def open_files(self):
-        files, _ = QFileDialog.getOpenFileNames(self, 'Открыть MP3-файлы', '', 'MP3 Files (*.mp3)')
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            'Открыть аудио-файлы',
+            '',
+            'Audio Files (*.mp3 *.wav *.flac *.ogg *.opus *.aac *.m4a *.wma);;All Files (*)'
+        )
         if not files:
             return
 
@@ -222,7 +248,7 @@ class PyTune(QWidget):
 
     def play_pause(self):
         if not self.playlist:
-            QMessageBox.information(self, 'Пусто', 'Добавьте MP3-файлы.')
+            QMessageBox.information(self, 'Пусто', 'Добавьте аудио-файлы.')
             return
 
         state = self.player.playbackState()
