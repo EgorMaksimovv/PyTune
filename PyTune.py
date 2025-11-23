@@ -2,7 +2,7 @@ import sys
 import os
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QPushButton, QSlider, QLabel,
-    QFileDialog, QHBoxLayout, QVBoxLayout, QListWidget, QMessageBox
+    QFileDialog, QHBoxLayout, QVBoxLayout, QListWidget, QMessageBox, QLineEdit
 )
 from PyQt6.QtCore import Qt, QUrl, QTimer
 from PyQt6.QtGui import QPixmap
@@ -29,6 +29,10 @@ class PyTune(QWidget):
 
         self.shuffle_mode = False
         self.repeat_mode = 0
+
+        self.search_bar = QLineEdit()
+        self.search_bar.setPlaceholderText("Поиск трека...")
+        self.search_bar.textChanged.connect(self.filter_list)
 
         self.list_widget = QListWidget()
 
@@ -86,6 +90,7 @@ class PyTune(QWidget):
         controls_layout.addWidget(self.volume_slider)
 
         left_layout = QVBoxLayout()
+        left_layout.addWidget(self.search_bar)  
         left_layout.addWidget(self.list_widget)
         left_layout.addLayout(controls_layout)
         left_layout.addWidget(self.position_slider)
@@ -120,6 +125,18 @@ class PyTune(QWidget):
         self.timer.start(500)
 
         self.load_playlist()
+
+    def filter_list(self, text):
+        text = text.lower().strip()
+
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            track = item.text().lower()
+
+            filename = os.path.basename(track)
+
+            match = text in filename.lower()
+            item.setHidden(not match)
 
     def set_default_cover(self):
         pix = QPixmap(200, 200)
@@ -381,3 +398,4 @@ if __name__ == '__main__':
     player = PyTune()
     player.show()
     sys.exit(app.exec())
+
