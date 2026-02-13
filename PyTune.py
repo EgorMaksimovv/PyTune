@@ -9,6 +9,12 @@ from PyQt6.QtGui import QPixmap
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC, TIT2, TPE1
+from mutagen.flac import FLAC
+from mutagen.mp4 import MP4
+from mutagen.asf import ASF
+from mutagen.oggvorbis import OggVorbis
+from mutagen.oggopus import OggOpus
+from mutagen.wave import WAVE
 import json
 import random
 
@@ -90,7 +96,7 @@ class PyTune(QWidget):
         controls_layout.addWidget(self.volume_slider)
 
         left_layout = QVBoxLayout()
-        left_layout.addWidget(self.search_bar)  
+        left_layout.addWidget(self.search_bar)
         left_layout.addWidget(self.list_widget)
         left_layout.addLayout(controls_layout)
         left_layout.addWidget(self.position_slider)
@@ -128,13 +134,10 @@ class PyTune(QWidget):
 
     def filter_list(self, text):
         text = text.lower().strip()
-
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             track = item.text().lower()
-
             filename = os.path.basename(track)
-
             match = text in filename.lower()
             item.setHidden(not match)
 
@@ -145,17 +148,19 @@ class PyTune(QWidget):
         self.title_label.setText("—")
         self.artist_label.setText("")
 
-    def update_cover(self, file_path):
-        self.set_default_cover()
+    def _extract_metadata(self, file_path):
+        """
+        Извлекает название, исполнителя и обложку из аудиофайла.
+        Возвращает кортеж (title, artist, cover_data).
+        """
         ext = os.path.splitext(file_path)[1].lower()
+        title = None
+        artist = None
+        cover_data = None
 
         try:
-            if ext == ".mp3":
+            if ext == '.mp3':
                 audio = MP3(file_path, ID3=ID3)
-
-                title = None
-                artist = None
-
                 if audio.tags:
                     for tag in audio.tags.values():
                         if isinstance(tag, TIT2):
@@ -163,43 +168,94 @@ class PyTune(QWidget):
                         elif isinstance(tag, TPE1):
                             artist = str(tag.text[0])
                         elif isinstance(tag, APIC):
-                            pixmap = QPixmap()
-                            pixmap.loadFromData(tag.data)
-                            scaled = pixmap.scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatio,
-                                                   Qt.TransformationMode.SmoothTransformation)
-                            self.cover_label.setPixmap(scaled)
-
+                            cover_data = tag.data
                 if not title:
                     title = os.path.basename(file_path)
+                return title, artist or "", cover_data
 
-                self.title_label.setText(title)
-                self.artist_label.setText(artist if artist else "")
-                return
-
-            elif ext == ".flac":
-                from mutagen.flac import FLAC
+            elif ext == '.flac':
                 audio = FLAC(file_path)
-
-                title = audio.get("title", [os.path.basename(file_path)])[0]
-                artist = audio.get("artist", [""])[0]
-
+                title = audio.get('title', [None])[0]
+                artist = audio.get('artist', [None])[0]
                 if audio.pictures:
-                    pic = audio.pictures[0]
-                    pixmap = QPixmap()
-                    pixmap.loadFromData(pic.data)
-                    scaled = pixmap.scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatio,
-                                           Qt.TransformationMode.SmoothTransformation)
-                    self.cover_label.setPixmap(scaled)
+                    cover_data = audio.pictures[0].data
+                if not title:
+                    title = os.path.basename(file_path)
+                return title, artist or "", cover_data
 
-                self.title_label.setText(title)
-                self.artist_label.setText(artist)
+            elif ext in ('.m4a', '.mp4', '.aac'):
+                audio = MP4(file_path)
+                title_list = audio.get('\xa9nam', [])
+                if title_list:
+                    title = str(title_list[0])
+                artist_list = audio.get('\xa9ART', [])
+                if artist_list:
+                    artist = str(artist_list[0])
+                covr = audio.get('covr', [])
+                if covr:
+                    cover_data = covr[0]
+                if not title:
+                    title = os.path.basename(file_path)
+                return title, artist or "", cover_data
+
+            elif ext in ('.wma', '.asf'):
+                audio = ASF(file_path)
+                title = audio.get('Title', [None])[0]
+                artist = audio.get('Author', [None])[0]
+                pic = audio.get('WM/Picture', [None])[0]
+                if pic:
+                    cover_data = pic.data
+                if not title:
+                    title = os.path.basename(file_path)
+                return title, artist or "", cover_data
+
+            elif ext in ('.ogg', '.opus'):
+                if ext == '.ogg':
+                    audio = OggVorbis(file_path)
+                else:
+                    audio = OggOpus(file_path)
+                title = audio.get('title', [None])[0]
+                artist = audio.get('artist', [None])[0]
+                if not title:
+                    title = os.path.basename(file_path)
+                return title, artist or "", None
+
+            elif ext == '.wav':
+                audio = WAVE(file_path)
+                if audio.tags:
+                    for tag in audio.tags.values():
+                        if isinstance(tag, TIT2):
+                            title = str(tag.text[0])
+                        elif isinstance(tag, TPE1):
+                            artist = str(tag.text[0])
+                        elif isinstance(tag, APIC):
+                            cover_data = tag.data
+                if not title:
+                    title = os.path.basename(file_path)
+                return title, artist or "", cover_data
+
+            else:
+                return os.path.basename(file_path), "", None
+
+        except Exception as e:
+            print(f"Ошибка чтения метаданных из {file_path}: {e}")
+            return os.path.basename(file_path), "", None
+
+    def update_cover(self, file_path):
+        title, artist, cover_data = self._extract_metadata(file_path)
+        self.title_label.setText(title)
+        self.artist_label.setText(artist)
+
+        if cover_data:
+            pixmap = QPixmap()
+            if pixmap.loadFromData(cover_data):
+                scaled = pixmap.scaled(200, 200,
+                                       Qt.AspectRatioMode.KeepAspectRatio,
+                                       Qt.TransformationMode.SmoothTransformation)
+                self.cover_label.setPixmap(scaled)
                 return
 
-        except:
-            pass
-
-        self.title_label.setText(os.path.basename(file_path))
-        self.artist_label.setText("")
+        self.set_default_cover()
 
     def toggle_shuffle(self):
         self.shuffle_mode = not self.shuffle_mode
@@ -398,4 +454,3 @@ if __name__ == '__main__':
     player = PyTune()
     player.show()
     sys.exit(app.exec())
-
