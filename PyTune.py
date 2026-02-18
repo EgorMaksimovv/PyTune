@@ -261,7 +261,6 @@ class PyTune(QWidget):
                         if isinstance(tag, USLT):
                             lyrics = tag.text
                             break
-                    # Если нет USLT, ищем TXXX:LYRICS
                     if not lyrics:
                         for tag in audio.tags.values():
                             if isinstance(tag, TXXX) and tag.desc.upper() == 'LYRICS':
@@ -285,10 +284,8 @@ class PyTune(QWidget):
                 if lyrics_list:
                     lyrics = lyrics_list[0]
                 else:
-                    # iTunes-style: ----:com.apple.iTunes:LYRICS
                     for key, value in audio.items():
                         if key.startswith('----:') and 'LYRICS' in key.upper():
-                            # value is list of bytes
                             lyrics = value[0].decode('utf-8', errors='ignore')
                             break
 
@@ -558,3 +555,4 @@ if __name__ == '__main__':
     player = PyTune()
     player.show()
     sys.exit(app.exec())
+
