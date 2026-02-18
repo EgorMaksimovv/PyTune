@@ -2,13 +2,14 @@ import sys
 import os
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QPushButton, QSlider, QLabel,
-    QFileDialog, QHBoxLayout, QVBoxLayout, QListWidget, QMessageBox, QLineEdit
+    QFileDialog, QHBoxLayout, QVBoxLayout, QListWidget, QMessageBox, QLineEdit,
+    QTabWidget, QTextEdit
 )
 from PyQt6.QtCore import Qt, QUrl, QTimer
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from mutagen.mp3 import MP3
-from mutagen.id3 import ID3, APIC, TIT2, TPE1
+from mutagen.id3 import ID3, APIC, TIT2, TPE1, USLT, TXXX
 from mutagen.flac import FLAC
 from mutagen.mp4 import MP4
 from mutagen.asf import ASF
@@ -24,7 +25,7 @@ class PyTune(QWidget):
         super().__init__()
 
         self.setWindowTitle('PyTune')
-        self.setMinimumSize(1150, 600)
+        self.setMinimumSize(1200, 600)
 
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
@@ -35,6 +36,8 @@ class PyTune(QWidget):
 
         self.shuffle_mode = False
         self.repeat_mode = 0
+
+        self.lyrics_cache = {}
 
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("Поиск трека...")
@@ -61,10 +64,27 @@ class PyTune(QWidget):
 
         self.time_label = QLabel('00:00 / 00:00')
 
+        self.tab_widget = QTabWidget()
+
+        cover_container = QWidget()
+        cover_layout_in_tab = QHBoxLayout(cover_container)
+        cover_layout_in_tab.setContentsMargins(0, 0, 0, 0)
+
         self.cover_label = QLabel()
         self.cover_label.setFixedSize(200, 200)
         self.cover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cover_label.setStyleSheet("border: 1px solid gray;")
+
+        cover_layout_in_tab.addStretch() 
+        cover_layout_in_tab.addWidget(self.cover_label, alignment=Qt.AlignmentFlag.AlignTop)
+        cover_layout_in_tab.addStretch()   
+        self.tab_widget.addTab(cover_container, "Обложка")
+
+
+        self.lyrics_text = QTextEdit()
+        self.lyrics_text.setReadOnly(True)
+        self.lyrics_text.setPlaceholderText("Текст песни отсутствует")
+        self.tab_widget.addTab(self.lyrics_text, "Текст")
 
         self.title_label = QLabel("—")
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -77,7 +97,7 @@ class PyTune(QWidget):
         self.set_default_cover()
 
         cover_layout = QVBoxLayout()
-        cover_layout.addWidget(self.cover_label)
+        cover_layout.addWidget(self.tab_widget)
         cover_layout.addWidget(self.title_label)
         cover_layout.addWidget(self.artist_label)
 
@@ -132,26 +152,9 @@ class PyTune(QWidget):
 
         self.load_playlist()
 
-    def filter_list(self, text):
-        text = text.lower().strip()
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
-            track = item.text().lower()
-            filename = os.path.basename(track)
-            match = text in filename.lower()
-            item.setHidden(not match)
-
-    def set_default_cover(self):
-        pix = QPixmap(200, 200)
-        pix.fill(Qt.GlobalColor.lightGray)
-        self.cover_label.setPixmap(pix)
-        self.title_label.setText("—")
-        self.artist_label.setText("")
-
     def _extract_metadata(self, file_path):
         """
         Извлекает название, исполнителя и обложку из аудиофайла.
-        Возвращает кортеж (title, artist, cover_data).
         """
         ext = os.path.splitext(file_path)[1].lower()
         title = None
@@ -241,7 +244,77 @@ class PyTune(QWidget):
             print(f"Ошибка чтения метаданных из {file_path}: {e}")
             return os.path.basename(file_path), "", None
 
+    def _get_lyrics(self, file_path):
+        """Извлекает текст песни из аудиофайла"""
+        if file_path in self.lyrics_cache:
+            return self.lyrics_cache[file_path]
+
+        ext = os.path.splitext(file_path)[1].lower()
+        lyrics = None
+
+        try:
+            if ext == '.mp3':
+                audio = MP3(file_path, ID3=ID3)
+                if audio.tags:
+                    # Ищем USLT
+                    for tag in audio.tags.values():
+                        if isinstance(tag, USLT):
+                            lyrics = tag.text
+                            break
+                    # Если нет USLT, ищем TXXX:LYRICS
+                    if not lyrics:
+                        for tag in audio.tags.values():
+                            if isinstance(tag, TXXX) and tag.desc.upper() == 'LYRICS':
+                                lyrics = tag.text[0]
+                                break
+
+            elif ext == '.flac':
+                audio = FLAC(file_path)
+                lyrics = audio.get('lyrics', [None])[0]
+
+            elif ext in ('.ogg', '.opus'):
+                if ext == '.ogg':
+                    audio = OggVorbis(file_path)
+                else:
+                    audio = OggOpus(file_path)
+                lyrics = audio.get('lyrics', [None])[0]
+
+            elif ext in ('.m4a', '.mp4'):
+                audio = MP4(file_path)
+                lyrics_list = audio.get('\xa9lyr', [])
+                if lyrics_list:
+                    lyrics = lyrics_list[0]
+                else:
+                    # iTunes-style: ----:com.apple.iTunes:LYRICS
+                    for key, value in audio.items():
+                        if key.startswith('----:') and 'LYRICS' in key.upper():
+                            # value is list of bytes
+                            lyrics = value[0].decode('utf-8', errors='ignore')
+                            break
+
+            elif ext in ('.wma', '.asf'):
+                audio = ASF(file_path)
+                lyrics = audio.get('WM/Lyrics', [None])[0]
+
+            elif ext == '.wav':
+                audio = WAVE(file_path)
+                if audio.tags:
+                    for tag in audio.tags.values():
+                        if isinstance(tag, USLT):
+                            lyrics = tag.text
+                            break
+
+        except Exception as e:
+            print(f"Ошибка извлечения текста из {file_path}: {e}")
+
+        if isinstance(lyrics, list):
+            lyrics = '\n'.join(lyrics)
+
+        self.lyrics_cache[file_path] = lyrics
+        return lyrics
+
     def update_cover(self, file_path):
+        """Обновляет обложку и информацию о треке."""
         title, artist, cover_data = self._extract_metadata(file_path)
         self.title_label.setText(title)
         self.artist_label.setText(artist)
@@ -256,6 +329,32 @@ class PyTune(QWidget):
                 return
 
         self.set_default_cover()
+
+    def update_lyrics(self, file_path):
+        """Обновляет отображаемый текст песни."""
+        lyrics = self._get_lyrics(file_path)
+        if lyrics:
+            self.lyrics_text.setText(lyrics)
+        else:
+            self.lyrics_text.clear()
+
+    def set_default_cover(self):
+        """Устанавливает заглушку для обложки и очищает текст."""
+        pix = QPixmap(200, 200)
+        pix.fill(Qt.GlobalColor.lightGray)
+        self.cover_label.setPixmap(pix)
+        self.title_label.setText("—")
+        self.artist_label.setText("")
+        self.lyrics_text.clear()
+
+    def filter_list(self, text):
+        text = text.lower().strip()
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            track = item.text().lower()
+            filename = os.path.basename(track)
+            match = text in filename.lower()
+            item.setHidden(not match)
 
     def toggle_shuffle(self):
         self.shuffle_mode = not self.shuffle_mode
@@ -295,10 +394,14 @@ class PyTune(QWidget):
             QMessageBox.information(self, 'Удаление', 'Выберите трек для удаления.')
             return
 
+        file_path = self.playlist[row]
         deleting_current = (row == self.current_index)
 
         self.playlist.pop(row)
         self.list_widget.takeItem(row)
+
+        if file_path in self.lyrics_cache:
+            del self.lyrics_cache[file_path]
 
         if not self.playlist:
             self.player.stop()
@@ -317,6 +420,7 @@ class PyTune(QWidget):
         self.player.setSource(url)
         self.player.play()
         self.update_cover(file_path)
+        self.update_lyrics(file_path)
         self.highlight_current()
 
     def play_pause(self):
