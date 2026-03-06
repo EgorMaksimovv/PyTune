@@ -8,7 +8,8 @@ from typing import Optional
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QPushButton, QSlider, QLabel,
     QFileDialog, QHBoxLayout, QVBoxLayout, QListWidget, QListWidgetItem,
-    QMessageBox, QLineEdit, QTabWidget, QTextEdit, QAbstractItemView
+    QMessageBox, QLineEdit, QTabWidget, QTextEdit, QAbstractItemView,
+    QDialog, QFormLayout, QDialogButtonBox, QScrollArea, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QUrl, QTimer, QThread, pyqtSignal, QMimeData
 from PyQt6.QtGui import QPixmap, QKeySequence, QShortcut, QDragEnterEvent, QDropEvent
@@ -16,8 +17,8 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC, TIT2, TPE1, USLT, TXXX
-from mutagen.flac import FLAC
-from mutagen.mp4 import MP4
+from mutagen.flac import FLAC, Picture
+from mutagen.mp4 import MP4, MP4Cover
 from mutagen.asf import ASF
 from mutagen.oggvorbis import OggVorbis
 from mutagen.oggopus import OggOpus
@@ -44,7 +45,6 @@ class TrackMeta:
 
 
 class MetaWorker(QThread):
-    """Читает метаданные одного трека в фоне и сигнализирует о результате."""
     finished = pyqtSignal(TrackMeta)
 
     def __init__(self, path: str, parent=None):
@@ -57,8 +57,6 @@ class MetaWorker(QThread):
 
 
 class MetaReader:
-    """Статический класс для чтения метаданных и текстов из аудиофайлов."""
-
     @staticmethod
     def read(path: str) -> TrackMeta:
         title, artist, cover = MetaReader._read_tags(path)
@@ -67,7 +65,6 @@ class MetaReader:
 
     @staticmethod
     def _open(path: str):
-        """Открывает файл нужным парсером и возвращает объект mutagen."""
         ext = os.path.splitext(path)[1].lower()
         if ext == '.mp3':
             return MP3(path, ID3=ID3), ext
@@ -103,31 +100,26 @@ class MetaReader:
                         artist = str(tag.text[0])
                     elif isinstance(tag, APIC) and not cover:
                         cover = tag.data
-
             elif ext == '.flac':
                 title = (audio.get('title') or [''])[0]
                 artist = (audio.get('artist') or [''])[0]
                 if audio.pictures:
                     cover = audio.pictures[0].data
-
             elif ext in ('.m4a', '.mp4', '.aac'):
                 title = str((audio.get('\xa9nam') or [''])[0])
                 artist = str((audio.get('\xa9ART') or [''])[0])
                 covr = audio.get('covr') or []
                 if covr:
                     cover = bytes(covr[0])
-
             elif ext in ('.wma', '.asf'):
                 title = str((audio.get('Title') or [''])[0])
                 artist = str((audio.get('Author') or [''])[0])
                 pic = (audio.get('WM/Picture') or [None])[0]
                 if pic:
                     cover = pic.data
-
             elif ext in ('.ogg', '.opus'):
                 title = (audio.get('title') or [''])[0]
                 artist = (audio.get('artist') or [''])[0]
-
             elif ext == '.wav':
                 tags = audio.tags or {}
                 for tag in tags.values():
@@ -137,10 +129,8 @@ class MetaReader:
                         artist = str(tag.text[0])
                     elif isinstance(tag, APIC) and not cover:
                         cover = tag.data
-
         except Exception as e:
             print(f"[MetaReader] Ошибка тегов {path}: {e}")
-
         return title or os.path.basename(path), artist, cover
 
     @staticmethod
@@ -150,7 +140,6 @@ class MetaReader:
             audio, ext = MetaReader._open(path)
             if audio is None:
                 return None
-
             if ext == '.mp3':
                 tags = audio.tags or {}
                 for tag in tags.values():
@@ -162,13 +151,10 @@ class MetaReader:
                         if isinstance(tag, TXXX) and tag.desc.upper() == 'LYRICS':
                             lyrics = tag.text[0]
                             break
-
             elif ext == '.flac':
                 lyrics = (audio.get('lyrics') or [None])[0]
-
             elif ext in ('.ogg', '.opus'):
                 lyrics = (audio.get('lyrics') or [None])[0]
-
             elif ext in ('.m4a', '.mp4'):
                 lyr = audio.get('\xa9lyr')
                 if lyr:
@@ -178,29 +164,215 @@ class MetaReader:
                         if k.startswith('----:') and 'LYRICS' in k.upper():
                             lyrics = v[0].decode('utf-8', errors='ignore')
                             break
-
             elif ext in ('.wma', '.asf'):
                 lyrics = str((audio.get('WM/Lyrics') or [None])[0])
-
             elif ext == '.wav':
                 tags = audio.tags or {}
                 for tag in tags.values():
                     if isinstance(tag, USLT):
                         lyrics = tag.text
                         break
-
         except Exception as e:
             print(f"[MetaReader] Ошибка текста {path}: {e}")
-
         if isinstance(lyrics, list):
             lyrics = '\n'.join(lyrics)
         return lyrics or None
 
+    @staticmethod
+    def write(path: str, title: str, artist: str, cover: Optional[bytes], lyrics: Optional[str]):
+        """Записывает метаданные обратно в файл."""
+        try:
+            audio, ext = MetaReader._open(path)
+            if audio is None:
+                return
+
+            if ext == '.mp3':
+                if audio.tags is None:
+                    audio.add_tags()
+                tags = audio.tags
+                tags.delall('TIT2'); tags.delall('TPE1')
+                tags.delall('APIC'); tags.delall('USLT')
+                tags['TIT2'] = TIT2(encoding=3, text=title)
+                tags['TPE1'] = TPE1(encoding=3, text=artist)
+                if cover:
+                    tags['APIC'] = APIC(encoding=3, mime='image/jpeg',
+                                        type=3, desc='Cover', data=cover)
+                if lyrics:
+                    tags['USLT'] = USLT(encoding=3, lang='rus', desc='', text=lyrics)
+                audio.save()
+
+            elif ext == '.flac':
+                audio['title'] = [title]
+                audio['artist'] = [artist]
+                if lyrics:
+                    audio['lyrics'] = [lyrics]
+                elif 'lyrics' in audio:
+                    del audio['lyrics']
+                if cover:
+                    pic = Picture()
+                    pic.type = 3
+                    pic.mime = 'image/jpeg'
+                    pic.data = cover
+                    audio.clear_pictures()
+                    audio.add_picture(pic)
+                audio.save()
+
+            elif ext in ('.m4a', '.mp4', '.aac'):
+                audio['\xa9nam'] = [title]
+                audio['\xa9ART'] = [artist]
+                if lyrics:
+                    audio['\xa9lyr'] = [lyrics]
+                elif '\xa9lyr' in audio:
+                    del audio['\xa9lyr']
+                if cover:
+                    audio['covr'] = [MP4Cover(cover, imageformat=MP4Cover.FORMAT_JPEG)]
+                audio.save()
+
+            elif ext in ('.ogg', '.opus'):
+                audio['title'] = [title]
+                audio['artist'] = [artist]
+                if lyrics:
+                    audio['lyrics'] = [lyrics]
+                elif 'lyrics' in audio:
+                    del audio['lyrics']
+                audio.save()
+
+            elif ext in ('.wma', '.asf'):
+                audio['Title'] = [title]
+                audio['Author'] = [artist]
+                if lyrics:
+                    audio['WM/Lyrics'] = [lyrics]
+                audio.save()
+
+            elif ext == '.wav':
+                if audio.tags is None:
+                    audio.add_tags()
+                tags = audio.tags
+                tags.delall('TIT2'); tags.delall('TPE1')
+                tags.delall('APIC'); tags.delall('USLT')
+                tags['TIT2'] = TIT2(encoding=3, text=title)
+                tags['TPE1'] = TPE1(encoding=3, text=artist)
+                if cover:
+                    tags['APIC'] = APIC(encoding=3, mime='image/jpeg',
+                                        type=3, desc='Cover', data=cover)
+                if lyrics:
+                    tags['USLT'] = USLT(encoding=3, lang='rus', desc='', text=lyrics)
+                audio.save()
+
+        except Exception as e:
+            print(f"[MetaReader] Ошибка записи {path}: {e}")
+            raise
+
+
+class EditMetaDialog(QDialog):
+    """Диалог для редактирования названия, исполнителя, обложки и текста трека."""
+
+    def __init__(self, meta: TrackMeta, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Редактировать тег")
+        self.setMinimumWidth(520)
+        self.setMinimumHeight(560)
+
+        self._cover_bytes: Optional[bytes] = meta.cover
+
+        self.title_edit  = QLineEdit(meta.title)
+        self.artist_edit = QLineEdit(meta.artist)
+
+        self.cover_label = QLabel()
+        self.cover_label.setFixedSize(180, 180)
+        self.cover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.cover_label.setStyleSheet("border: 1px solid #aaa; border-radius: 4px; background: #f0f0f0;")
+        self._refresh_cover_preview()
+
+        self.cover_btn        = QPushButton("Выбрать обложку…")
+        self.cover_remove_btn = QPushButton("Удалить обложку")
+        self.cover_remove_btn.setEnabled(self._cover_bytes is not None)
+        cover_btns = QHBoxLayout()
+        cover_btns.addWidget(self.cover_btn)
+        cover_btns.addWidget(self.cover_remove_btn)
+
+        cover_box = QVBoxLayout()
+        cover_box.addWidget(self.cover_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+        cover_box.addLayout(cover_btns)
+
+        self.lyrics_edit = QTextEdit()
+        self.lyrics_edit.setPlaceholderText("Текст песни…")
+        self.lyrics_edit.setText(meta.lyrics or "")
+        self.lyrics_edit.setMinimumHeight(160)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+
+        form = QFormLayout()
+        form.setSpacing(10)
+        form.addRow("Название:", self.title_edit)
+        form.addRow("Исполнитель:", self.artist_edit)
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setSpacing(12)
+        main_layout.addLayout(form)
+        main_layout.addLayout(cover_box)
+        main_layout.addWidget(QLabel("Текст песни:"))
+        main_layout.addWidget(self.lyrics_edit)
+        main_layout.addWidget(buttons)
+
+        self.cover_btn.clicked.connect(self._choose_cover)
+        self.cover_remove_btn.clicked.connect(self._remove_cover)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+    def _refresh_cover_preview(self):
+        if self._cover_bytes:
+            pix = QPixmap()
+            if pix.loadFromData(self._cover_bytes):
+                self.cover_label.setPixmap(
+                    pix.scaled(180, 180,
+                               Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+                )
+                return
+        pix = QPixmap(180, 180)
+        pix.fill(Qt.GlobalColor.lightGray)
+        self.cover_label.setPixmap(pix)
+
+    def _choose_cover(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выбрать обложку", "",
+            "Images (*.jpg *.jpeg *.png *.bmp *.webp);;All Files (*)"
+        )
+        if path:
+            with open(path, 'rb') as f:
+                self._cover_bytes = f.read()
+            self._refresh_cover_preview()
+            self.cover_remove_btn.setEnabled(True)
+
+    def _remove_cover(self):
+        self._cover_bytes = None
+        self._refresh_cover_preview()
+        self.cover_remove_btn.setEnabled(False)
+
+    @property
+    def result_title(self) -> str:
+        return self.title_edit.text().strip()
+
+    @property
+    def result_artist(self) -> str:
+        return self.artist_edit.text().strip()
+
+    @property
+    def result_cover(self) -> Optional[bytes]:
+        return self._cover_bytes
+
+    @property
+    def result_lyrics(self) -> Optional[str]:
+        text = self.lyrics_edit.toPlainText().strip()
+        return text or None
+
 
 class DnDListWidget(QListWidget):
-    """QListWidget с поддержкой drag-and-drop файлов извне и перестановки внутри."""
-    files_dropped = pyqtSignal(list)      
-    order_changed = pyqtSignal(list)        
+    files_dropped = pyqtSignal(list)
+    order_changed = pyqtSignal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -236,19 +408,19 @@ class DnDListWidget(QListWidget):
 class PyTune(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('PyTune')
-        self.setMinimumSize(1200, 600)
+        self.setWindowTitle('Jamify player')
+        self.setMinimumSize(1300, 650)
         self.setAcceptDrops(True)
 
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
         self.player.setAudioOutput(self.audio_output)
 
-        self.playlist: list[str] = []    
+        self.playlist: list[str] = []
         self.meta_cache: dict[str, TrackMeta] = {}
         self.current_index: int = -1
         self.shuffle_mode: bool = False
-        self.repeat_mode: int = 0      
+        self.repeat_mode: int = 0
         self._meta_worker: Optional[MetaWorker] = None
 
         self._build_ui()
@@ -264,6 +436,7 @@ class PyTune(QWidget):
 
         self.open_btn    = QPushButton('Открыть')
         self.delete_btn  = QPushButton('Удалить')
+        self.edit_btn    = QPushButton('✏ Редактировать')
         self.prev_btn    = QPushButton('⏮')
         self.play_btn    = QPushButton('▶')
         self.stop_btn    = QPushButton('■')
@@ -282,9 +455,9 @@ class PyTune(QWidget):
         self.time_label = QLabel('00:00 / 00:00')
 
         controls = QHBoxLayout()
-        for w in (self.open_btn, self.delete_btn, self.prev_btn,
-                  self.play_btn, self.stop_btn, self.next_btn,
-                  self.shuffle_btn, self.repeat_btn):
+        for w in (self.open_btn, self.delete_btn, self.edit_btn,
+                  self.prev_btn, self.play_btn, self.stop_btn,
+                  self.next_btn, self.shuffle_btn, self.repeat_btn):
             controls.addWidget(w)
         controls.addStretch()
         controls.addWidget(QLabel('Громкость'))
@@ -339,6 +512,7 @@ class PyTune(QWidget):
     def _connect_signals(self):
         self.open_btn.clicked.connect(self.open_files)
         self.delete_btn.clicked.connect(self.delete_selected)
+        self.edit_btn.clicked.connect(self.edit_selected_meta)  
         self.play_btn.clicked.connect(self.play_pause)
         self.stop_btn.clicked.connect(self.stop)
         self.prev_btn.clicked.connect(self.prev_track)
@@ -349,6 +523,8 @@ class PyTune(QWidget):
         self.list_widget.itemDoubleClicked.connect(self._on_item_double_clicked)
         self.list_widget.files_dropped.connect(self._add_paths)
         self.list_widget.order_changed.connect(self._on_order_changed)
+
+        self.cover_label.mouseDoubleClickEvent = lambda _: self.edit_selected_meta()
 
         self.search_bar.textChanged.connect(self._filter_list)
 
@@ -366,28 +542,68 @@ class PyTune(QWidget):
 
     def _setup_shortcuts(self):
         shortcuts = {
-            Qt.Key.Key_Space:           self.play_pause,
-            Qt.Key.Key_MediaPlay:       self.play_pause,
-            Qt.Key.Key_MediaStop:       self.stop,
-            Qt.Key.Key_MediaNext:       self.next_track,
-            Qt.Key.Key_MediaPrevious:   self.prev_track,
-            QKeySequence("Ctrl+O"):     self.open_files,
-            QKeySequence("Delete"):     self.delete_selected,
-            QKeySequence("Right"):      lambda: self._seek_relative(+5_000),
-            QKeySequence("Left"):       lambda: self._seek_relative(-5_000),
-            QKeySequence("Shift+Right"):lambda: self._seek_relative(+30_000),
-            QKeySequence("Shift+Left"): lambda: self._seek_relative(-30_000),
-            QKeySequence("Up"):         lambda: self._change_volume(+5),
-            QKeySequence("Down"):       lambda: self._change_volume(-5),
-            QKeySequence("Ctrl+Right"): self.next_track,
-            QKeySequence("Ctrl+Left"):  self.prev_track,
-            QKeySequence("Ctrl+S"):     self.toggle_shuffle,
-            QKeySequence("Ctrl+R"):     self.toggle_repeat,
+            Qt.Key.Key_Space:            self.play_pause,
+            Qt.Key.Key_MediaPlay:        self.play_pause,
+            Qt.Key.Key_MediaStop:        self.stop,
+            Qt.Key.Key_MediaNext:        self.next_track,
+            Qt.Key.Key_MediaPrevious:    self.prev_track,
+            QKeySequence("Ctrl+O"):      self.open_files,
+            QKeySequence("Delete"):      self.delete_selected,
+            QKeySequence("Ctrl+E"):      self.edit_selected_meta,  
+            QKeySequence("Right"):       lambda: self._seek_relative(+5_000),
+            QKeySequence("Left"):        lambda: self._seek_relative(-5_000),
+            QKeySequence("Shift+Right"): lambda: self._seek_relative(+30_000),
+            QKeySequence("Shift+Left"):  lambda: self._seek_relative(-30_000),
+            QKeySequence("Up"):          lambda: self._change_volume(+5),
+            QKeySequence("Down"):        lambda: self._change_volume(-5),
+            QKeySequence("Ctrl+Right"):  self.next_track,
+            QKeySequence("Ctrl+Left"):   self.prev_track,
+            QKeySequence("Ctrl+S"):      self.toggle_shuffle,
+            QKeySequence("Ctrl+R"):      self.toggle_repeat,
         }
         for key, slot in shortcuts.items():
             sc = QShortcut(QKeySequence(key) if isinstance(key, Qt.Key) else key, self)
             sc.activated.connect(slot)
 
+
+    def edit_selected_meta(self):
+        """Открывает диалог редактирования тегов для выбранного трека."""
+        row = self.list_widget.currentRow()
+        if row < 0:
+            QMessageBox.information(self, 'Редактирование', 'Выберите трек для редактирования.')
+            return
+
+        path = self.playlist[row]
+
+        meta = self.meta_cache.get(path) or TrackMeta(path=path)
+
+        dlg = EditMetaDialog(meta, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        new_title  = dlg.result_title  or os.path.basename(path)
+        new_artist = dlg.result_artist
+        new_cover  = dlg.result_cover
+        new_lyrics = dlg.result_lyrics
+
+        try:
+            MetaReader.write(path, new_title, new_artist, new_cover, new_lyrics)
+        except Exception as e:
+            QMessageBox.critical(self, 'Ошибка записи',
+                                 f'Не удалось сохранить теги:\n{e}')
+            return
+
+        updated_meta = TrackMeta(
+            path=path, title=new_title, artist=new_artist,
+            cover=new_cover, lyrics=new_lyrics
+        )
+        self.meta_cache[path] = updated_meta
+
+        item = self.list_widget.item(row)
+        item.setText(updated_meta.display_name)
+
+        if row == self.current_index:
+            self._show_meta(updated_meta)
 
     def open_files(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -397,7 +613,6 @@ class PyTune(QWidget):
         self._add_paths(files)
 
     def _add_paths(self, paths: list[str]):
-        """Добавляет файлы/папки в плейлист"""
         added = False
         for p in paths:
             if os.path.isdir(p):
@@ -415,7 +630,6 @@ class PyTune(QWidget):
             self._play_index(0)
 
     def _add_single(self, path: str) -> bool:
-        """Добавляет один файл, если его ещё нет. Возвращает True при успехе."""
         if path in self.playlist:
             return False
         if not os.path.isfile(path):
@@ -442,7 +656,6 @@ class PyTune(QWidget):
                 self._show_meta(meta)
 
     def _on_order_changed(self, new_order: list[str]):
-        """Синхронизирует self.playlist после drag-and-drop внутри списка."""
         current_path = self.playlist[self.current_index] if self.current_index >= 0 else None
         self.playlist = new_order
         if current_path and current_path in self.playlist:
@@ -453,17 +666,14 @@ class PyTune(QWidget):
         if row < 0:
             QMessageBox.information(self, 'Удаление', 'Выберите трек для удаления.')
             return
-
         path = self.playlist.pop(row)
         self.list_widget.takeItem(row)
         self.meta_cache.pop(path, None)
-
         if not self.playlist:
             self.player.stop()
             self.current_index = -1
             self._set_default_cover()
             return
-
         if row == self.current_index:
             self.current_index = min(row, len(self.playlist) - 1)
             self._play_index(self.current_index)
@@ -475,16 +685,13 @@ class PyTune(QWidget):
             return
         self.current_index = index
         path = self.playlist[index]
-
         if not os.path.isfile(path):
             QMessageBox.warning(self, 'Файл не найден', f'Файл не существует:\n{path}')
             self.delete_selected()
             return
-
         self.player.setSource(QUrl.fromLocalFile(path))
         self.player.play()
         self._highlight_current()
-
         if path in self.meta_cache:
             self._show_meta(self.meta_cache[path])
         else:
@@ -547,9 +754,7 @@ class PyTune(QWidget):
         self.player.setPosition(pos)
 
     def _change_volume(self, delta: int):
-        self.volume_slider.setValue(
-            max(0, min(100, self.volume_slider.value() + delta))
-        )
+        self.volume_slider.setValue(max(0, min(100, self.volume_slider.value() + delta)))
 
     def toggle_shuffle(self):
         self.shuffle_mode = not self.shuffle_mode
@@ -676,3 +881,4 @@ if __name__ == '__main__':
     window = PyTune()
     window.show()
     sys.exit(app.exec())
+
