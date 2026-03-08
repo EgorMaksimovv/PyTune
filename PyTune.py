@@ -408,7 +408,7 @@ class DnDListWidget(QListWidget):
 class PyTune(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Jamify player')
+        self.setWindowTitle('PyTune')
         self.setMinimumSize(1300, 650)
         self.setAcceptDrops(True)
 
@@ -881,4 +881,5 @@ if __name__ == '__main__':
     window = PyTune()
     window.show()
     sys.exit(app.exec())
+
 
