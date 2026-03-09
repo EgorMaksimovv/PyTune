@@ -23,11 +23,11 @@ from mutagen.asf import ASF
 from mutagen.oggvorbis import OggVorbis
 from mutagen.oggopus import OggOpus
 from mutagen.wave import WAVE
-from version import __version__
+from version import __version__ # type: ignore
 
 
 SUPPORTED_EXTENSIONS = {'.mp3', '.wav', '.flac', '.ogg', '.opus', '.aac', '.m4a', '.wma', '.asf'}
-PLAYLIST_FILE = "playlist.json"
+PLAYLISTS_FILE = "playlists.json"
 
 
 @dataclass
@@ -406,19 +406,149 @@ class DnDListWidget(QListWidget):
             self.order_changed.emit(order)
 
 
+class PlaylistManagerPanel(QWidget):
+    """Боковая панель для управления несколькими плейлистами."""
+    playlist_selected = pyqtSignal(str)
+    playlist_renamed  = pyqtSignal(str, str)
+    playlist_deleted  = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(190)
+
+        title = QLabel("Плейлисты")
+        title.setStyleSheet("font-weight: bold; font-size: 13px;")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+
+        self.new_btn    = QPushButton("＋ Новый")
+        self.rename_btn = QPushButton("✏ Переименовать")
+        self.delete_btn = QPushButton("✕ Удалить")
+
+        for btn in (self.new_btn, self.rename_btn, self.delete_btn):
+            btn.setFixedHeight(26)
+
+        btn_layout = QVBoxLayout()
+        btn_layout.setSpacing(4)
+        btn_layout.addWidget(self.new_btn)
+        btn_layout.addWidget(self.rename_btn)
+        btn_layout.addWidget(self.delete_btn)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 8, 6, 8)
+        layout.setSpacing(6)
+        layout.addWidget(title)
+        layout.addWidget(self.list_widget)
+        layout.addLayout(btn_layout)
+
+        self.new_btn.clicked.connect(self._on_new)
+        self.rename_btn.clicked.connect(self._on_rename)
+        self.delete_btn.clicked.connect(self._on_delete)
+        self.list_widget.currentRowChanged.connect(self._on_row_changed)
+
+    def populate(self, names: list, current: str):
+        self.list_widget.blockSignals(True)
+        self.list_widget.clear()
+        for n in names:
+            self.list_widget.addItem(n)
+        items = self.list_widget.findItems(current, Qt.MatchFlag.MatchExactly)
+        if items:
+            self.list_widget.setCurrentItem(items[0])
+        self.list_widget.blockSignals(False)
+
+    def current_name(self) -> Optional[str]:
+        item = self.list_widget.currentItem()
+        return item.text() if item else None
+
+    def _ask_name(self, title: str, default: str = "") -> Optional[str]:
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setFixedWidth(300)
+        edit = QLineEdit(default)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(edit)
+        lay.addWidget(btns)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            return edit.text().strip() or None
+        return None
+
+    def _on_row_changed(self, row: int):
+        item = self.list_widget.item(row)
+        if item:
+            self.playlist_selected.emit(item.text())
+
+    def _on_new(self):
+        name = self._ask_name("Новый плейлист", "Плейлист")
+        if not name:
+            return
+        existing = [self.list_widget.item(i).text()
+                    for i in range(self.list_widget.count())]
+        if name in existing:
+            QMessageBox.warning(self, "Ошибка", f'Плейлист "{name}" уже существует.')
+            return
+        self.list_widget.addItem(name)
+        self.list_widget.setCurrentRow(self.list_widget.count() - 1)
+
+    def _on_rename(self):
+        item = self.list_widget.currentItem()
+        if not item:
+            return
+        old = item.text()
+        new = self._ask_name("Переименовать плейлист", old)
+        if not new or new == old:
+            return
+        existing = [self.list_widget.item(i).text()
+                    for i in range(self.list_widget.count())]
+        if new in existing:
+            QMessageBox.warning(self, "Ошибка", f'Плейлист "{new}" уже существует.')
+            return
+        item.setText(new)
+        self.playlist_renamed.emit(old, new)
+
+    def _on_delete(self):
+        item = self.list_widget.currentItem()
+        if not item:
+            return
+        if self.list_widget.count() == 1:
+            QMessageBox.information(self, "Удаление", "Нельзя удалить последний плейлист.")
+            return
+        name = item.text()
+        answer = QMessageBox.question(
+            self, "Удаление плейлиста",
+            f'Удалить плейлист "{name}"?\nТреки с диска удалены не будут.',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            row = self.list_widget.row(item)
+            self.list_widget.takeItem(row)
+            self.playlist_deleted.emit(name)
+            new_row = min(row, self.list_widget.count() - 1)
+            self.list_widget.setCurrentRow(new_row)
+
+
 class PyTune(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f'PyTune {__version__}')
-        self.setMinimumSize(1300, 650)
+        self.setMinimumSize(1500, 650)
         self.setAcceptDrops(True)
 
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
         self.player.setAudioOutput(self.audio_output)
 
-        self.playlist: list[str] = []
-        self.meta_cache: dict[str, TrackMeta] = {}
+        self.playlists: dict = {}
+        self.current_playlist_name: str = "Плейлист 1"
+
+        self.playlist: list = []
+        self.meta_cache: dict = {}
         self.current_index: int = -1
         self.shuffle_mode: bool = False
         self.repeat_mode: int = 0
@@ -427,7 +557,7 @@ class PyTune(QWidget):
         self._build_ui()
         self._connect_signals()
         self._setup_shortcuts()
-        self.load_playlist()
+        self.load_playlists()
 
     def _build_ui(self):
         self.search_bar = QLineEdit()
@@ -464,12 +594,21 @@ class PyTune(QWidget):
         controls.addWidget(QLabel('Громкость'))
         controls.addWidget(self.volume_slider)
 
+        self.playlist_name_label = QLabel("")
+        self.playlist_name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.playlist_name_label.setStyleSheet(
+            "font-weight: bold; font-size: 12px; color: #555; padding: 2px;"
+        )
+
         left = QVBoxLayout()
+        left.addWidget(self.playlist_name_label)
         left.addWidget(self.search_bar)
         left.addWidget(self.list_widget)
         left.addLayout(controls)
         left.addWidget(self.position_slider)
         left.addWidget(self.time_label)
+
+        self.playlist_panel = PlaylistManagerPanel()
 
         self.tab_widget = QTabWidget()
 
@@ -506,6 +645,7 @@ class PyTune(QWidget):
         self._set_default_cover()
 
         main = QHBoxLayout()
+        main.addWidget(self.playlist_panel)
         main.addLayout(left, 3)
         main.addLayout(right, 1)
         self.setLayout(main)
@@ -526,6 +666,10 @@ class PyTune(QWidget):
         self.list_widget.order_changed.connect(self._on_order_changed)
 
         self.cover_label.mouseDoubleClickEvent = lambda _: self.edit_selected_meta()
+
+        self.playlist_panel.playlist_selected.connect(self._switch_playlist)
+        self.playlist_panel.playlist_renamed.connect(self._rename_playlist)
+        self.playlist_panel.playlist_deleted.connect(self._delete_playlist)
 
         self.search_bar.textChanged.connect(self._filter_list)
 
@@ -837,25 +981,23 @@ class PyTune(QWidget):
         paths = [u.toLocalFile() for u in e.mimeData().urls()]
         self._add_paths(paths)
 
-    def save_playlist(self):
-        data = {"playlist": self.playlist, "current_index": self.current_index}
-        try:
-            with open(PLAYLIST_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=4)
-        except Exception as e:
-            print(f"[PyTune] Не удалось сохранить плейлист: {e}")
+    def _save_current_playlist_state(self):
+        """Сохраняет состояние активного плейлиста в словарь playlists."""
+        self.playlists[self.current_playlist_name] = {
+            "tracks": list(self.playlist),
+            "current_index": self.current_index,
+        }
 
-    def load_playlist(self):
-        if not os.path.exists(PLAYLIST_FILE):
-            return
-        try:
-            with open(PLAYLIST_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            print(f"[PyTune] Не удалось загрузить плейлист: {e}")
-            return
+    def _load_playlist_into_ui(self, name: str):
+        """Загружает плейлист name в виджет треков."""
+        self.player.stop()
+        self.list_widget.clear()
+        self.playlist.clear()
+        self.current_index = -1
+        self._set_default_cover()
 
-        paths = [p for p in data.get("playlist", []) if os.path.isfile(p)]
+        data = self.playlists.get(name, {})
+        paths = [p for p in data.get("tracks", []) if os.path.isfile(p)]
         saved_index = data.get("current_index", -1)
 
         for path in paths:
@@ -872,8 +1014,85 @@ class PyTune(QWidget):
             self.current_index = saved_index if 0 <= saved_index < len(self.playlist) else 0
             self._highlight_current()
 
+        self.playlist_name_label.setText(f"▶  {name}")
+
+    def _switch_playlist(self, name: str):
+        if name == self.current_playlist_name:
+            return
+        self._save_current_playlist_state()
+        if name not in self.playlists:
+            self.playlists[name] = {"tracks": [], "current_index": -1}
+        self.current_playlist_name = name
+        self._load_playlist_into_ui(name)
+
+    def _rename_playlist(self, old: str, new: str):
+        if old in self.playlists:
+            self.playlists[new] = self.playlists.pop(old)
+        if self.current_playlist_name == old:
+            self.current_playlist_name = new
+            self.playlist_name_label.setText(f"▶  {new}")
+
+    def _delete_playlist(self, name: str):
+        self.playlists.pop(name, None)
+        if self.current_playlist_name == name:
+            new_name = self.playlist_panel.current_name()
+            if new_name:
+                if new_name not in self.playlists:
+                    self.playlists[new_name] = {"tracks": [], "current_index": -1}
+                self.current_playlist_name = new_name
+                self._load_playlist_into_ui(new_name)
+
+    def save_playlists(self):
+        self._save_current_playlist_state()
+        data = {
+            "current_playlist": self.current_playlist_name,
+            "playlists": self.playlists,
+        }
+        try:
+            with open(PLAYLISTS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            print(f"[PyTune] Не удалось сохранить плейлисты: {e}")
+
+    def load_playlists(self):
+        default_name = "Плейлист 1"
+        if not os.path.exists(PLAYLISTS_FILE):
+            old_file = "playlist.json"
+            if os.path.exists(old_file):
+                try:
+                    with open(old_file, "r", encoding="utf-8") as f:
+                        old_data = json.load(f)
+                    self.playlists[default_name] = {
+                        "tracks": old_data.get("playlist", []),
+                        "current_index": old_data.get("current_index", -1),
+                    }
+                except Exception:
+                    pass
+            if not self.playlists:
+                self.playlists[default_name] = {"tracks": [], "current_index": -1}
+            self.current_playlist_name = default_name
+        else:
+            try:
+                with open(PLAYLISTS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.playlists = data.get("playlists", {})
+                self.current_playlist_name = data.get("current_playlist", default_name)
+            except Exception as e:
+                print(f"[PyTune] Не удалось загрузить плейлисты: {e}")
+                self.playlists[default_name] = {"tracks": [], "current_index": -1}
+                self.current_playlist_name = default_name
+
+        if not self.playlists:
+            self.playlists[default_name] = {"tracks": [], "current_index": -1}
+            self.current_playlist_name = default_name
+        if self.current_playlist_name not in self.playlists:
+            self.current_playlist_name = next(iter(self.playlists))
+
+        self.playlist_panel.populate(list(self.playlists.keys()), self.current_playlist_name)
+        self._load_playlist_into_ui(self.current_playlist_name)
+
     def closeEvent(self, event):
-        self.save_playlist()
+        self.save_playlists()
         event.accept()
 
 
@@ -882,6 +1101,3 @@ if __name__ == '__main__':
     window = PyTune()
     window.show()
     sys.exit(app.exec())
-
-
-
