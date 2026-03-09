@@ -23,6 +23,7 @@ from mutagen.asf import ASF
 from mutagen.oggvorbis import OggVorbis
 from mutagen.oggopus import OggOpus
 from mutagen.wave import WAVE
+from version import __version__
 
 
 SUPPORTED_EXTENSIONS = {'.mp3', '.wav', '.flac', '.ogg', '.opus', '.aac', '.m4a', '.wma', '.asf'}
@@ -408,7 +409,7 @@ class DnDListWidget(QListWidget):
 class PyTune(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('PyTune')
+        self.setWindowTitle(f'PyTune {__version__}')
         self.setMinimumSize(1300, 650)
         self.setAcceptDrops(True)
 
@@ -881,5 +882,6 @@ if __name__ == '__main__':
     window = PyTune()
     window.show()
     sys.exit(app.exec())
+
 
 
