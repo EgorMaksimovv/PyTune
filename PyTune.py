@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import math
 import random
 from dataclasses import dataclass, field
 from typing import Optional
@@ -12,7 +13,8 @@ from PyQt6.QtWidgets import (
     QDialog, QFormLayout, QDialogButtonBox, QScrollArea, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QUrl, QTimer, QThread, pyqtSignal, QMimeData
-from PyQt6.QtGui import QPixmap, QKeySequence, QShortcut, QDragEnterEvent, QDropEvent
+from PyQt6.QtGui import QPixmap, QKeySequence, QShortcut, QDragEnterEvent, QDropEvent, QIcon, QColor, QPainter, QFont
+from PyQt6.QtWidgets import QSystemTrayIcon, QMenu
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 from mutagen.mp3 import MP3
@@ -27,7 +29,7 @@ from version import __version__ # type: ignore
 
 
 SUPPORTED_EXTENSIONS = {'.mp3', '.wav', '.flac', '.ogg', '.opus', '.aac', '.m4a', '.wma', '.asf'}
-PLAYLISTS_FILE = "playlists.json"
+PLAYLISTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "playlists.json")
 
 
 @dataclass
@@ -60,9 +62,93 @@ class MetaWorker(QThread):
 class MetaReader:
     @staticmethod
     def read(path: str) -> TrackMeta:
-        title, artist, cover = MetaReader._read_tags(path)
-        lyrics = MetaReader._read_lyrics(path)
-        return TrackMeta(path=path, title=title, artist=artist, cover=cover, lyrics=lyrics)
+        """Читает все метаданные за один проход по файлу."""
+        title = artist = ""
+        cover = None
+        lyrics = None
+        try:
+            audio, ext = MetaReader._open(path)
+            if audio is None:
+                return TrackMeta(path=path, title=os.path.basename(path))
+
+            if ext == '.mp3':
+                tags = audio.tags or {}
+                for tag in tags.values():
+                    if isinstance(tag, TIT2):
+                        title = str(tag.text[0])
+                    elif isinstance(tag, TPE1):
+                        artist = str(tag.text[0])
+                    elif isinstance(tag, APIC) and not cover:
+                        cover = tag.data
+                    elif isinstance(tag, USLT) and not lyrics:
+                        lyrics = tag.text
+                if not lyrics:
+                    for tag in tags.values():
+                        if isinstance(tag, TXXX) and tag.desc.upper() == 'LYRICS':
+                            lyrics = tag.text[0]
+                            break
+
+            elif ext == '.flac':
+                title = (audio.get('title') or [''])[0]
+                artist = (audio.get('artist') or [''])[0]
+                if audio.pictures:
+                    cover = audio.pictures[0].data
+                lyrics = (audio.get('lyrics') or [None])[0]
+
+            elif ext in ('.m4a', '.mp4', '.aac'):
+                title = str((audio.get('\xa9nam') or [''])[0])
+                artist = str((audio.get('\xa9ART') or [''])[0])
+                covr = audio.get('covr') or []
+                if covr:
+                    cover = bytes(covr[0])
+                lyr = audio.get('\xa9lyr')
+                if lyr:
+                    lyrics = lyr[0]
+                else:
+                    for k, v in audio.items():
+                        if k.startswith('----:') and 'LYRICS' in k.upper():
+                            lyrics = v[0].decode('utf-8', errors='ignore')
+                            break
+
+            elif ext in ('.wma', '.asf'):
+                title = str((audio.get('Title') or [''])[0])
+                artist = str((audio.get('Author') or [''])[0])
+                pic = (audio.get('WM/Picture') or [None])[0]
+                if pic:
+                    cover = pic.data
+                raw = (audio.get('WM/Lyrics') or [None])[0]
+                lyrics = str(raw) if raw is not None else None
+
+            elif ext in ('.ogg', '.opus'):
+                title = (audio.get('title') or [''])[0]
+                artist = (audio.get('artist') or [''])[0]
+                lyrics = (audio.get('lyrics') or [None])[0]
+
+            elif ext == '.wav':
+                tags = audio.tags or {}
+                for tag in tags.values():
+                    if isinstance(tag, TIT2):
+                        title = str(tag.text[0])
+                    elif isinstance(tag, TPE1):
+                        artist = str(tag.text[0])
+                    elif isinstance(tag, APIC) and not cover:
+                        cover = tag.data
+                    elif isinstance(tag, USLT) and not lyrics:
+                        lyrics = tag.text
+
+        except Exception as e:
+            print(f"[MetaReader] Ошибка чтения {path}: {e}")
+
+        if isinstance(lyrics, list):
+            lyrics = '\n'.join(lyrics)
+
+        return TrackMeta(
+            path=path,
+            title=title or os.path.basename(path),
+            artist=artist,
+            cover=cover,
+            lyrics=lyrics or None,
+        )
 
     @staticmethod
     def _open(path: str):
@@ -82,102 +168,6 @@ class MetaReader:
         if ext == '.wav':
             return WAVE(path), ext
         return None, ext
-
-    @staticmethod
-    def _read_tags(path: str):
-        title = artist = ""
-        cover = None
-        try:
-            audio, ext = MetaReader._open(path)
-            if audio is None:
-                return os.path.basename(path), "", None
-
-            if ext == '.mp3':
-                tags = audio.tags or {}
-                for tag in tags.values():
-                    if isinstance(tag, TIT2):
-                        title = str(tag.text[0])
-                    elif isinstance(tag, TPE1):
-                        artist = str(tag.text[0])
-                    elif isinstance(tag, APIC) and not cover:
-                        cover = tag.data
-            elif ext == '.flac':
-                title = (audio.get('title') or [''])[0]
-                artist = (audio.get('artist') or [''])[0]
-                if audio.pictures:
-                    cover = audio.pictures[0].data
-            elif ext in ('.m4a', '.mp4', '.aac'):
-                title = str((audio.get('\xa9nam') or [''])[0])
-                artist = str((audio.get('\xa9ART') or [''])[0])
-                covr = audio.get('covr') or []
-                if covr:
-                    cover = bytes(covr[0])
-            elif ext in ('.wma', '.asf'):
-                title = str((audio.get('Title') or [''])[0])
-                artist = str((audio.get('Author') or [''])[0])
-                pic = (audio.get('WM/Picture') or [None])[0]
-                if pic:
-                    cover = pic.data
-            elif ext in ('.ogg', '.opus'):
-                title = (audio.get('title') or [''])[0]
-                artist = (audio.get('artist') or [''])[0]
-            elif ext == '.wav':
-                tags = audio.tags or {}
-                for tag in tags.values():
-                    if isinstance(tag, TIT2):
-                        title = str(tag.text[0])
-                    elif isinstance(tag, TPE1):
-                        artist = str(tag.text[0])
-                    elif isinstance(tag, APIC) and not cover:
-                        cover = tag.data
-        except Exception as e:
-            print(f"[MetaReader] Ошибка тегов {path}: {e}")
-        return title or os.path.basename(path), artist, cover
-
-    @staticmethod
-    def _read_lyrics(path: str) -> Optional[str]:
-        lyrics = None
-        try:
-            audio, ext = MetaReader._open(path)
-            if audio is None:
-                return None
-            if ext == '.mp3':
-                tags = audio.tags or {}
-                for tag in tags.values():
-                    if isinstance(tag, USLT):
-                        lyrics = tag.text
-                        break
-                if not lyrics:
-                    for tag in tags.values():
-                        if isinstance(tag, TXXX) and tag.desc.upper() == 'LYRICS':
-                            lyrics = tag.text[0]
-                            break
-            elif ext == '.flac':
-                lyrics = (audio.get('lyrics') or [None])[0]
-            elif ext in ('.ogg', '.opus'):
-                lyrics = (audio.get('lyrics') or [None])[0]
-            elif ext in ('.m4a', '.mp4'):
-                lyr = audio.get('\xa9lyr')
-                if lyr:
-                    lyrics = lyr[0]
-                else:
-                    for k, v in audio.items():
-                        if k.startswith('----:') and 'LYRICS' in k.upper():
-                            lyrics = v[0].decode('utf-8', errors='ignore')
-                            break
-            elif ext in ('.wma', '.asf'):
-                lyrics = str((audio.get('WM/Lyrics') or [None])[0])
-            elif ext == '.wav':
-                tags = audio.tags or {}
-                for tag in tags.values():
-                    if isinstance(tag, USLT):
-                        lyrics = tag.text
-                        break
-        except Exception as e:
-            print(f"[MetaReader] Ошибка текста {path}: {e}")
-        if isinstance(lyrics, list):
-            lyrics = '\n'.join(lyrics)
-        return lyrics or None
 
     @staticmethod
     def write(path: str, title: str, artist: str, cover: Optional[bytes], lyrics: Optional[str]):
@@ -533,11 +523,117 @@ class PlaylistManagerPanel(QWidget):
             self.list_widget.setCurrentRow(new_row)
 
 
+class WaveformSlider(QWidget):
+    """Прогресс-полоса с градиентом и анимированным псевдо-waveform."""
+    sliderMoved = pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(36)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        self._minimum = 0
+        self._maximum = 0
+        self._value   = 0
+
+        self._bars = [0.3 + 0.7 * random.random() for _ in range(80)]
+
+        self._anim_phase = 0.0
+        self._anim_timer = QTimer(self)
+        self._anim_timer.timeout.connect(self._tick_anim)
+        self._anim_timer.start(40)
+
+    def _tick_anim(self):
+        self._anim_phase = (self._anim_phase + 0.12) % (2 * 3.14159)
+        self.update()
+
+    def setRange(self, minimum: int, maximum: int):
+        self._minimum = minimum
+        self._maximum = maximum
+        self.update()
+
+    def setValue(self, value: int):
+        self._value = value
+        self.update()
+
+    def value(self) -> int:
+        return self._value
+
+    def _fraction(self) -> float:
+        if self._maximum <= self._minimum:
+            return 0.0
+        return (self._value - self._minimum) / (self._maximum - self._minimum)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        w, h = self.width(), self.height()
+        frac = self._fraction()
+        played_x = int(w * frac)
+
+        bar_count = len(self._bars)
+        bar_w = w / bar_count
+        center_y = h / 2
+
+        for i, bar_h_frac in enumerate(self._bars):
+            bx = i * bar_w
+            dist = abs(i / bar_count - frac)
+            pulse = 1.0 + 0.18 * math.exp(-dist * 30) * math.sin(self._anim_phase + i * 0.3)
+            bar_h = bar_h_frac * (h * 0.75) * pulse
+            by = center_y - bar_h / 2
+
+            played = (bx + bar_w / 2) < played_x
+
+            if played:
+                t = i / bar_count
+                r = int(92  + (86  - 92)  * t)
+                g = int(107 + (179 - 107) * t)
+                b = int(192 + (233 - 192) * t)
+                color = QColor(r, g, b)
+            else:
+                color = QColor(180, 180, 190, 120)
+
+            painter.setBrush(color)
+            painter.setPen(Qt.PenStyle.NoPen)
+            rect_w = max(1.0, bar_w - 1.5)
+            painter.drawRoundedRect(
+                int(bx), int(by), int(rect_w), int(bar_h), 2, 2
+            )
+
+        cx = played_x
+        cy = int(center_y)
+        pulse_r = 6 + 1.5 * math.sin(self._anim_phase)
+        painter.setBrush(QColor(255, 255, 255))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(int(cx - pulse_r), int(cy - pulse_r),
+                            int(pulse_r * 2), int(pulse_r * 2))
+
+        painter.end()
+
+    def mousePressEvent(self, event):
+        self._seek(event.position().x())
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            self._seek(event.position().x())
+
+    def _seek(self, x: float):
+        if self._maximum <= self._minimum:
+            return
+        frac = max(0.0, min(1.0, x / self.width()))
+        val = int(self._minimum + frac * (self._maximum - self._minimum))
+        self._value = val
+        self.update()
+        self.sliderMoved.emit(val)
+
+
 class PyTune(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f'PyTune {__version__}')
-        self.setMinimumSize(1500, 650)
+        self.setMinimumSize(900, 550)
         self.setAcceptDrops(True)
 
         self.player = QMediaPlayer()
@@ -557,6 +653,7 @@ class PyTune(QWidget):
         self._build_ui()
         self._connect_signals()
         self._setup_shortcuts()
+        self._setup_tray()
         self.load_playlists()
 
     def _build_ui(self):
@@ -575,7 +672,7 @@ class PyTune(QWidget):
         self.shuffle_btn = QPushButton('🔀')
         self.repeat_btn  = QPushButton('🔁')
 
-        self.position_slider = QSlider(Qt.Orientation.Horizontal)
+        self.position_slider = WaveformSlider()
         self.position_slider.setRange(0, 0)
 
         self.volume_slider = QSlider(Qt.Orientation.Horizontal)
@@ -585,14 +682,19 @@ class PyTune(QWidget):
 
         self.time_label = QLabel('00:00 / 00:00')
 
-        controls = QHBoxLayout()
-        for w in (self.open_btn, self.delete_btn, self.edit_btn,
-                  self.prev_btn, self.play_btn, self.stop_btn,
+        top_controls = QHBoxLayout()
+        for w in (self.open_btn, self.delete_btn, self.edit_btn):
+            top_controls.addWidget(w)
+        top_controls.addStretch()
+        top_controls.addWidget(QLabel('Громкость'))
+        top_controls.addWidget(self.volume_slider)
+
+        bottom_controls = QHBoxLayout()
+        bottom_controls.addStretch()
+        for w in (self.prev_btn, self.play_btn, self.stop_btn,
                   self.next_btn, self.shuffle_btn, self.repeat_btn):
-            controls.addWidget(w)
-        controls.addStretch()
-        controls.addWidget(QLabel('Громкость'))
-        controls.addWidget(self.volume_slider)
+            bottom_controls.addWidget(w)
+        bottom_controls.addStretch()
 
         self.playlist_name_label = QLabel("")
         self.playlist_name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -604,7 +706,8 @@ class PyTune(QWidget):
         left.addWidget(self.playlist_name_label)
         left.addWidget(self.search_bar)
         left.addWidget(self.list_widget)
-        left.addLayout(controls)
+        left.addLayout(top_controls)
+        left.addLayout(bottom_controls)
         left.addWidget(self.position_slider)
         left.addWidget(self.time_label)
 
@@ -799,6 +902,8 @@ class PyTune(QWidget):
         if 0 <= self.current_index < len(self.playlist):
             if self.playlist[self.current_index] == meta.path:
                 self._show_meta(meta)
+                if not self.isVisible():
+                    self._notify_track(meta)
 
     def _on_order_changed(self, new_order: list[str]):
         current_path = self.playlist[self.current_index] if self.current_index >= 0 else None
@@ -839,6 +944,8 @@ class PyTune(QWidget):
         self._highlight_current()
         if path in self.meta_cache:
             self._show_meta(self.meta_cache[path])
+            if not self.isVisible():
+                self._notify_track(self.meta_cache[path])
         else:
             self._set_default_cover()
 
@@ -1042,6 +1149,89 @@ class PyTune(QWidget):
                 self.current_playlist_name = new_name
                 self._load_playlist_into_ui(new_name)
 
+    def _make_tray_icon(self) -> QIcon:
+        """Генерирует простую иконку в виде музыкальной ноты."""
+        pix = QPixmap(64, 64)
+        pix.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(QColor("#5c6bc0"))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(0, 0, 64, 64)
+        painter.setPen(QColor("white"))
+        font = QFont("Arial", 32, QFont.Weight.Bold)
+        painter.setFont(font)
+        painter.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "♪")
+        painter.end()
+        return QIcon(pix)
+
+    def _setup_tray(self):
+        """Создаёт иконку в системном трее с контекстным меню."""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray = None
+            return
+
+        self._tray = QSystemTrayIcon(self._make_tray_icon(), self)
+        self._tray.setToolTip("PyTune")
+
+        menu = QMenu()
+        self._tray_play_action = menu.addAction("▶  Воспроизвести / Пауза")
+        self._tray_play_action.triggered.connect(self.play_pause)
+
+        tray_next = menu.addAction("⏭  Следующий")
+        tray_next.triggered.connect(self.next_track)
+
+        tray_prev = menu.addAction("⏮  Предыдущий")
+        tray_prev.triggered.connect(self.prev_track)
+
+        menu.addSeparator()
+
+        tray_show = menu.addAction("🪟  Показать окно")
+        tray_show.triggered.connect(self._show_from_tray)
+
+        menu.addSeparator()
+
+        tray_quit = menu.addAction("✕  Выход")
+        tray_quit.triggered.connect(self._quit_app)
+
+        self._tray.setContextMenu(menu)
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.show()
+
+        self.player.playbackStateChanged.connect(self._update_tray_play_action)
+
+    def _update_tray_play_action(self, state):
+        if self._tray is None:
+            return
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self._tray_play_action.setText("⏸  Пауза")
+        else:
+            self._tray_play_action.setText("▶  Воспроизвести")
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._show_from_tray()
+
+    def _show_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_app(self):
+        self._tray_quit = True
+        self.save_playlists()
+        if self._tray:
+            self._tray.hide()
+        QApplication.quit()
+
+    def _notify_track(self, meta: TrackMeta):
+        """Показывает всплывающее уведомление о смене трека."""
+        if self._tray is None or not self._tray.isVisible():
+            return
+        title = meta.title or os.path.basename(meta.path)
+        body = meta.artist if meta.artist else "Неизвестный исполнитель"
+        self._tray.showMessage(title, body, self._make_tray_icon(), 3000)
+
     def save_playlists(self):
         self._save_current_playlist_state()
         data = {
@@ -1092,8 +1282,21 @@ class PyTune(QWidget):
         self._load_playlist_into_ui(self.current_playlist_name)
 
     def closeEvent(self, event):
-        self.save_playlists()
-        event.accept()
+        if getattr(self, '_tray_quit', False) or self._tray is None:
+            self.save_playlists()
+            if self._tray:
+                self._tray.hide()
+            event.accept()
+            QApplication.quit()
+        else:
+            event.ignore()
+            self.hide()
+            self._tray.showMessage(
+                "PyTune",
+                "Приложение свёрнуто в трей. Двойной клик для открытия.",
+                self._make_tray_icon(),
+                2000
+            )
 
 
 if __name__ == '__main__':
