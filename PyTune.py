@@ -735,10 +735,14 @@ class PyTune(QWidget):
         self.title_label = QLabel("—")
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.title_label.setStyleSheet("font-weight: bold; font-size: 14px; margin-top: 5px;")
+        self.title_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.title_label.setMinimumWidth(0)
 
         self.artist_label = QLabel("")
         self.artist_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.artist_label.setStyleSheet("font-size: 13px; color: gray;")
+        self.artist_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.artist_label.setMinimumWidth(0)
 
         right = QVBoxLayout()
         right.addWidget(self.tab_widget)
@@ -1029,9 +1033,18 @@ class PyTune(QWidget):
             )
             item.setHidden(text not in haystack)
 
+    def _elide(self, label: QLabel, text: str) -> None:
+        """Устанавливает текст с обрезкой «…» по ширине лейбла."""
+        fm = label.fontMetrics()
+        available = max(label.width(), 100)
+        elided = fm.elidedText(text, Qt.TextElideMode.ElideRight, available)
+        label.setText(elided)
+        label.setToolTip(text)
+
     def _show_meta(self, meta: TrackMeta):
-        self.title_label.setText(meta.title or os.path.basename(meta.path))
-        self.artist_label.setText(meta.artist)
+        title = meta.title or os.path.basename(meta.path)
+        self._elide(self.title_label, title)
+        self._elide(self.artist_label, meta.artist)
         if meta.cover:
             pix = QPixmap()
             if pix.loadFromData(meta.cover):
@@ -1280,6 +1293,16 @@ class PyTune(QWidget):
 
         self.playlist_panel.populate(list(self.playlists.keys()), self.current_playlist_name)
         self._load_playlist_into_ui(self.current_playlist_name)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if 0 <= self.current_index < len(self.playlist):
+            path = self.playlist[self.current_index]
+            meta = self.meta_cache.get(path)
+            if meta:
+                title = meta.title or os.path.basename(meta.path)
+                self._elide(self.title_label, title)
+                self._elide(self.artist_label, meta.artist)
 
     def closeEvent(self, event):
         if getattr(self, '_tray_quit', False) or self._tray is None:
