@@ -25,12 +25,11 @@ from mutagen.asf import ASF
 from mutagen.oggvorbis import OggVorbis
 from mutagen.oggopus import OggOpus
 from mutagen.wave import WAVE
-from version import __version__ # type: ignore
+from version import __version__  # type: ignore
 
 
 SUPPORTED_EXTENSIONS = {'.mp3', '.wav', '.flac', '.ogg', '.opus', '.aac', '.m4a', '.wma', '.asf'}
 PLAYLISTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "playlists.json")
-
 
 @dataclass
 class TrackMeta:
@@ -253,6 +252,275 @@ class MetaReader:
         except Exception as e:
             print(f"[MetaReader] Ошибка записи {path}: {e}")
             raise
+
+
+class PlaylistModel:
+    """
+    Хранит список треков, кэш метаданных и текущий индекс воспроизведения.
+    Не знает ничего об UI и плеере — только данные.
+    """
+
+    def __init__(self):
+        self.tracks: list[str] = []
+        self.meta_cache: dict[str, TrackMeta] = {}
+        self.current_index: int = -1
+
+    def add(self, path: str) -> bool:
+        """Добавляет трек. Возвращает True, если трек был добавлен."""
+        if path in self.tracks or not os.path.isfile(path):
+            return False
+        self.tracks.append(path)
+        return True
+
+    def remove(self, index: int) -> Optional[str]:
+        """Удаляет трек по индексу, обновляет current_index. Возвращает путь."""
+        if not (0 <= index < len(self.tracks)):
+            return None
+        path = self.tracks.pop(index)
+        self.meta_cache.pop(path, None)
+        if not self.tracks:
+            self.current_index = -1
+        elif index == self.current_index:
+            self.current_index = min(index, len(self.tracks) - 1)
+        elif index < self.current_index:
+            self.current_index -= 1
+        return path
+
+    def reorder(self, new_order: list[str]):
+        """Пересобирает список треков после drag-and-drop."""
+        current_path = self.current_track
+        self.tracks = new_order
+        if current_path and current_path in self.tracks:
+            self.current_index = self.tracks.index(current_path)
+
+    def clear(self):
+        self.tracks.clear()
+        self.meta_cache.clear()
+        self.current_index = -1
+
+    @property
+    def current_track(self) -> Optional[str]:
+        if 0 <= self.current_index < len(self.tracks):
+            return self.tracks[self.current_index]
+        return None
+
+    def random_index(self) -> int:
+        if len(self.tracks) <= 1:
+            return 0
+        idx = random.randrange(len(self.tracks))
+        while idx == self.current_index:
+            idx = random.randrange(len(self.tracks))
+        return idx
+
+
+    def set_meta(self, meta: TrackMeta):
+        self.meta_cache[meta.path] = meta
+
+    def get_meta(self, path: str) -> Optional[TrackMeta]:
+        return self.meta_cache.get(path)
+
+    def to_dict(self) -> dict:
+        return {
+            "tracks": list(self.tracks),
+            "current_index": self.current_index,
+        }
+
+    def from_dict(self, data: dict):
+        self.tracks = [p for p in data.get("tracks", []) if os.path.isfile(p)]
+        idx = data.get("current_index", -1)
+        self.current_index = idx if 0 <= idx < len(self.tracks) else (0 if self.tracks else -1)
+
+
+class SettingsManager:
+    """
+    Отвечает исключительно за персистентность: читает / пишет playlists.json.
+    Не знает об UI, плеере или PlaylistModel.
+    """
+
+    DEFAULT_NAME = "Плейлист 1"
+
+    @staticmethod
+    def load() -> tuple[dict, str]:
+        """
+        Возвращает (playlists_dict, current_playlist_name).
+        playlists_dict: {name: {"tracks": [...], "current_index": int}}
+        """
+        default_name = SettingsManager.DEFAULT_NAME
+        playlists: dict = {}
+
+        if not os.path.exists(PLAYLISTS_FILE):
+            # Миграция со старого формата
+            old_file = "playlist.json"
+            if os.path.exists(old_file):
+                try:
+                    with open(old_file, "r", encoding="utf-8") as f:
+                        old_data = json.load(f)
+                    playlists[default_name] = {
+                        "tracks": old_data.get("playlist", []),
+                        "current_index": old_data.get("current_index", -1),
+                    }
+                except Exception:
+                    pass
+            if not playlists:
+                playlists[default_name] = {"tracks": [], "current_index": -1}
+            return playlists, default_name
+
+        try:
+            with open(PLAYLISTS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            playlists = data.get("playlists", {})
+            current = data.get("current_playlist", default_name)
+        except Exception as e:
+            print(f"[SettingsManager] Не удалось загрузить плейлисты: {e}")
+            playlists = {default_name: {"tracks": [], "current_index": -1}}
+            current = default_name
+
+        if not playlists:
+            playlists[default_name] = {"tracks": [], "current_index": -1}
+            current = default_name
+        if current not in playlists:
+            current = next(iter(playlists))
+        return playlists, current
+
+    @staticmethod
+    def save(playlists: dict, current_playlist_name: str):
+        data = {
+            "current_playlist": current_playlist_name,
+            "playlists": playlists,
+        }
+        try:
+            with open(PLAYLISTS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            print(f"[SettingsManager] Не удалось сохранить плейлисты: {e}")
+
+
+class PlaybackController:
+    """
+    Инкапсулирует логику воспроизведения: play/pause/stop/next/prev/seek.
+    Знает о QMediaPlayer и PlaylistModel, не знает об UI-виджетах.
+    """
+
+    REPEAT_OFF   = 0
+    REPEAT_ONE   = 1
+    REPEAT_ALL   = 2
+
+    track_changed = None   
+
+    def __init__(self, model: PlaylistModel):
+        self.model        = model
+        self.player       = QMediaPlayer()
+        self.audio_output = QAudioOutput()
+        self.player.setAudioOutput(self.audio_output)
+
+        self.shuffle_mode: bool = False
+        self.repeat_mode:  int  = self.REPEAT_OFF
+
+        self.on_track_changed = None
+
+
+    def play_index(self, index: int):
+        if not (0 <= index < len(self.model.tracks)):
+            return
+        path = self.model.tracks[index]
+        if not os.path.isfile(path):
+            return
+        self.model.current_index = index
+        self.player.setSource(QUrl.fromLocalFile(path))
+        self.player.play()
+        if self.on_track_changed:
+            self.on_track_changed(index)
+
+    def play_pause(self) -> bool:
+        """Переключает play/pause. Возвращает True, если треки вообще есть."""
+        if not self.model.tracks:
+            return False
+        state = self.player.playbackState()
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        elif self.player.source().isEmpty():
+            self.play_index(max(self.model.current_index, 0))
+        else:
+            self.player.play()
+        return True
+
+    def stop(self):
+        self.player.stop()
+
+    def next_track(self):
+        if not self.model.tracks:
+            return
+        if self.shuffle_mode:
+            self.play_index(self.model.random_index())
+            return
+        if self.repeat_mode == self.REPEAT_ONE:
+            self.play_index(self.model.current_index)
+            return
+        nxt = self.model.current_index + 1
+        if nxt >= len(self.model.tracks):
+            if self.repeat_mode == self.REPEAT_ALL:
+                self.play_index(0)
+            else:
+                self.stop()
+        else:
+            self.play_index(nxt)
+
+    def prev_track(self):
+        if not self.model.tracks:
+            return
+        if self.player.position() > 2000:
+            self.player.setPosition(0)
+            return
+        if self.shuffle_mode:
+            self.play_index(self.model.random_index())
+        else:
+            self.play_index((self.model.current_index - 1) % len(self.model.tracks))
+
+    def seek_relative(self, ms: int):
+        pos = max(0, min(self.player.position() + ms, self.player.duration()))
+        self.player.setPosition(pos)
+
+    def set_volume(self, percent: int):
+        self.audio_output.setVolume(max(0, min(100, percent)) / 100)
+
+    def toggle_shuffle(self) -> bool:
+        self.shuffle_mode = not self.shuffle_mode
+        return self.shuffle_mode
+
+    def toggle_repeat(self) -> int:
+        self.repeat_mode = (self.repeat_mode + 1) % 3
+        return self.repeat_mode
+
+
+class MetaThreadPool:
+    """
+    Хранит ссылки на все активные MetaWorker-потоки.
+    Удаляет поток из пула автоматически по сигналу finished,
+    предотвращая преждевременную сборку мусора.
+    """
+
+    def __init__(self):
+        self._active: list[MetaWorker] = []
+
+    def submit(self, path: str, on_ready) -> MetaWorker:
+        worker = MetaWorker(path)
+        worker.finished.connect(on_ready)
+        worker.finished.connect(lambda _meta, w=worker: self._release(w))
+        self._active.append(worker)
+        worker.start()
+        return worker
+
+    def _release(self, worker: MetaWorker):
+        try:
+            self._active.remove(worker)
+        except ValueError:
+            pass
+
+    def cancel_all(self):
+        """Запрашивает остановку всех активных потоков (best-effort)."""
+        for w in list(self._active):
+            w.quit()
+        self._active.clear()
 
 
 class EditMetaDialog(QDialog):
@@ -636,19 +904,14 @@ class PyTune(QWidget):
         self.setMinimumSize(900, 550)
         self.setAcceptDrops(True)
 
-        self.player = QMediaPlayer()
-        self.audio_output = QAudioOutput()
-        self.player.setAudioOutput(self.audio_output)
+        self._model      = PlaylistModel()
+        self._ctrl       = PlaybackController(self._model)
+        self._thread_pool = MetaThreadPool()
 
-        self.playlists: dict = {}
-        self.current_playlist_name: str = "Плейлист 1"
+        self._ctrl.on_track_changed = self._on_track_changed_by_ctrl
 
-        self.playlist: list = []
-        self.meta_cache: dict = {}
-        self.current_index: int = -1
-        self.shuffle_mode: bool = False
-        self.repeat_mode: int = 0
-        self._meta_worker: Optional[MetaWorker] = None
+        self.playlists: dict           = {}
+        self.current_playlist_name: str = SettingsManager.DEFAULT_NAME
 
         self._build_ui()
         self._connect_signals()
@@ -678,7 +941,7 @@ class PyTune(QWidget):
         self.volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.volume_slider.setRange(0, 100)
         self.volume_slider.setValue(80)
-        self.audio_output.setVolume(0.8)
+        self._ctrl.set_volume(80)
 
         self.time_label = QLabel('00:00 / 00:00')
 
@@ -760,13 +1023,13 @@ class PyTune(QWidget):
     def _connect_signals(self):
         self.open_btn.clicked.connect(self.open_files)
         self.delete_btn.clicked.connect(self.delete_selected)
-        self.edit_btn.clicked.connect(self.edit_selected_meta)  
-        self.play_btn.clicked.connect(self.play_pause)
-        self.stop_btn.clicked.connect(self.stop)
-        self.prev_btn.clicked.connect(self.prev_track)
-        self.next_btn.clicked.connect(self.next_track)
-        self.shuffle_btn.clicked.connect(self.toggle_shuffle)
-        self.repeat_btn.clicked.connect(self.toggle_repeat)
+        self.edit_btn.clicked.connect(self.edit_selected_meta)
+        self.play_btn.clicked.connect(self._on_play_pause_clicked)
+        self.stop_btn.clicked.connect(self._ctrl.stop)
+        self.prev_btn.clicked.connect(self._ctrl.prev_track)
+        self.next_btn.clicked.connect(self._ctrl.next_track)
+        self.shuffle_btn.clicked.connect(self._on_toggle_shuffle)
+        self.repeat_btn.clicked.connect(self._on_toggle_repeat)
 
         self.list_widget.itemDoubleClicked.connect(self._on_item_double_clicked)
         self.list_widget.files_dropped.connect(self._add_paths)
@@ -780,13 +1043,13 @@ class PyTune(QWidget):
 
         self.search_bar.textChanged.connect(self._filter_list)
 
-        self.position_slider.sliderMoved.connect(self.player.setPosition)
-        self.volume_slider.valueChanged.connect(lambda v: self.audio_output.setVolume(v / 100))
+        self.position_slider.sliderMoved.connect(self._ctrl.player.setPosition)
+        self.volume_slider.valueChanged.connect(self._ctrl.set_volume)
 
-        self.player.positionChanged.connect(self.position_slider.setValue)
-        self.player.durationChanged.connect(lambda d: self.position_slider.setRange(0, d))
-        self.player.playbackStateChanged.connect(self._update_play_button)
-        self.player.mediaStatusChanged.connect(self._on_media_status)
+        self._ctrl.player.positionChanged.connect(self.position_slider.setValue)
+        self._ctrl.player.durationChanged.connect(lambda d: self.position_slider.setRange(0, d))
+        self._ctrl.player.playbackStateChanged.connect(self._update_play_button)
+        self._ctrl.player.mediaStatusChanged.connect(self._on_media_status)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._update_time_label)
@@ -794,68 +1057,67 @@ class PyTune(QWidget):
 
     def _setup_shortcuts(self):
         shortcuts = {
-            Qt.Key.Key_Space:            self.play_pause,
-            Qt.Key.Key_MediaPlay:        self.play_pause,
-            Qt.Key.Key_MediaStop:        self.stop,
-            Qt.Key.Key_MediaNext:        self.next_track,
-            Qt.Key.Key_MediaPrevious:    self.prev_track,
+            Qt.Key.Key_Space:            self._on_play_pause_clicked,
+            Qt.Key.Key_MediaPlay:        self._on_play_pause_clicked,
+            Qt.Key.Key_MediaStop:        self._ctrl.stop,
+            Qt.Key.Key_MediaNext:        self._ctrl.next_track,
+            Qt.Key.Key_MediaPrevious:    self._ctrl.prev_track,
             QKeySequence("Ctrl+O"):      self.open_files,
             QKeySequence("Delete"):      self.delete_selected,
-            QKeySequence("Ctrl+E"):      self.edit_selected_meta,  
-            QKeySequence("Right"):       lambda: self._seek_relative(+5_000),
-            QKeySequence("Left"):        lambda: self._seek_relative(-5_000),
-            QKeySequence("Shift+Right"): lambda: self._seek_relative(+30_000),
-            QKeySequence("Shift+Left"):  lambda: self._seek_relative(-30_000),
-            QKeySequence("Up"):          lambda: self._change_volume(+5),
-            QKeySequence("Down"):        lambda: self._change_volume(-5),
-            QKeySequence("Ctrl+Right"):  self.next_track,
-            QKeySequence("Ctrl+Left"):   self.prev_track,
-            QKeySequence("Ctrl+S"):      self.toggle_shuffle,
-            QKeySequence("Ctrl+R"):      self.toggle_repeat,
+            QKeySequence("Ctrl+E"):      self.edit_selected_meta,
+            QKeySequence("Right"):       lambda: self._ctrl.seek_relative(+5_000),
+            QKeySequence("Left"):        lambda: self._ctrl.seek_relative(-5_000),
+            QKeySequence("Shift+Right"): lambda: self._ctrl.seek_relative(+30_000),
+            QKeySequence("Shift+Left"):  lambda: self._ctrl.seek_relative(-30_000),
+            QKeySequence("Up"):          lambda: self.volume_slider.setValue(
+                                             min(100, self.volume_slider.value() + 5)),
+            QKeySequence("Down"):        lambda: self.volume_slider.setValue(
+                                             max(0, self.volume_slider.value() - 5)),
+            QKeySequence("Ctrl+Right"):  self._ctrl.next_track,
+            QKeySequence("Ctrl+Left"):   self._ctrl.prev_track,
+            QKeySequence("Ctrl+S"):      self._on_toggle_shuffle,
+            QKeySequence("Ctrl+R"):      self._on_toggle_repeat,
         }
         for key, slot in shortcuts.items():
             sc = QShortcut(QKeySequence(key) if isinstance(key, Qt.Key) else key, self)
             sc.activated.connect(slot)
 
+    def _on_play_pause_clicked(self):
+        if not self._ctrl.play_pause():
+            QMessageBox.information(self, 'Пусто', 'Добавьте аудио-файлы.')
 
-    def edit_selected_meta(self):
-        """Открывает диалог редактирования тегов для выбранного трека."""
-        row = self.list_widget.currentRow()
-        if row < 0:
-            QMessageBox.information(self, 'Редактирование', 'Выберите трек для редактирования.')
-            return
+    def _on_toggle_shuffle(self):
+        active = self._ctrl.toggle_shuffle()
+        self.shuffle_btn.setStyleSheet("background: lightgreen;" if active else "")
 
-        path = self.playlist[row]
+    def _on_toggle_repeat(self):
+        mode = self._ctrl.toggle_repeat()
+        icons = ['🔁', '🔂', '🔁∞']
+        self.repeat_btn.setText(icons[mode])
 
-        meta = self.meta_cache.get(path) or TrackMeta(path=path)
+    def _on_item_double_clicked(self, item: QListWidgetItem):
+        row = self.list_widget.row(item)
+        if 0 <= row < len(self._model.tracks):
+            self._ctrl.play_index(row)
 
-        dlg = EditMetaDialog(meta, self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
+    def _on_media_status(self, status):
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self._ctrl.next_track()
 
-        new_title  = dlg.result_title  or os.path.basename(path)
-        new_artist = dlg.result_artist
-        new_cover  = dlg.result_cover
-        new_lyrics = dlg.result_lyrics
+    def _on_track_changed_by_ctrl(self, index: int):
+        """Вызывается PlaybackController после смены трека."""
+        self._highlight_current()
+        path = self._model.tracks[index]
+        meta = self._model.get_meta(path)
+        if meta:
+            self._show_meta(meta)
+            if not self.isVisible():
+                self._notify_track(meta)
+        else:
+            self._set_default_cover()
 
-        try:
-            MetaReader.write(path, new_title, new_artist, new_cover, new_lyrics)
-        except Exception as e:
-            QMessageBox.critical(self, 'Ошибка записи',
-                                 f'Не удалось сохранить теги:\n{e}')
-            return
-
-        updated_meta = TrackMeta(
-            path=path, title=new_title, artist=new_artist,
-            cover=new_cover, lyrics=new_lyrics
-        )
-        self.meta_cache[path] = updated_meta
-
-        item = self.list_widget.item(row)
-        item.setText(updated_meta.display_name)
-
-        if row == self.current_index:
-            self._show_meta(updated_meta)
+    def _on_order_changed(self, new_order: list[str]):
+        self._model.reorder(new_order)
 
     def open_files(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -871,162 +1133,153 @@ class PyTune(QWidget):
                 for root, _, files in os.walk(p):
                     for f in sorted(files):
                         if os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS:
-                            self._add_single(os.path.join(root, f))
-                            added = True
+                            if self._add_single(os.path.join(root, f)):
+                                added = True
             elif os.path.splitext(p)[1].lower() in SUPPORTED_EXTENSIONS:
                 if self._add_single(p):
                     added = True
 
-        if added and self.current_index == -1:
-            self.current_index = 0
-            self._play_index(0)
+        if added and self._model.current_index == -1:
+            self._ctrl.play_index(0)
 
     def _add_single(self, path: str) -> bool:
-        if path in self.playlist:
+        if not self._model.add(path):
             return False
-        if not os.path.isfile(path):
-            return False
-        self.playlist.append(path)
         item = QListWidgetItem(os.path.basename(path))
         item.setData(Qt.ItemDataRole.UserRole, path)
         item.setToolTip(path)
         self.list_widget.addItem(item)
-        worker = MetaWorker(path, self)
-        worker.finished.connect(self._on_meta_ready)
-        worker.start()
+        self._thread_pool.submit(path, self._on_meta_ready)
         return True
 
     def _on_meta_ready(self, meta: TrackMeta):
-        self.meta_cache[meta.path] = meta
+        self._model.set_meta(meta)
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             if item.data(Qt.ItemDataRole.UserRole) == meta.path:
                 item.setText(meta.display_name)
                 break
-        if 0 <= self.current_index < len(self.playlist):
-            if self.playlist[self.current_index] == meta.path:
-                self._show_meta(meta)
-                if not self.isVisible():
-                    self._notify_track(meta)
+        if self._model.current_track == meta.path:
+            self._show_meta(meta)
+            if not self.isVisible():
+                self._notify_track(meta)
 
-    def _on_order_changed(self, new_order: list[str]):
-        current_path = self.playlist[self.current_index] if self.current_index >= 0 else None
-        self.playlist = new_order
-        if current_path and current_path in self.playlist:
-            self.current_index = self.playlist.index(current_path)
+    def edit_selected_meta(self):
+        row = self.list_widget.currentRow()
+        if row < 0:
+            QMessageBox.information(self, 'Редактирование', 'Выберите трек для редактирования.')
+            return
+
+        path = self._model.tracks[row]
+        meta = self._model.get_meta(path) or TrackMeta(path=path)
+
+        dlg = EditMetaDialog(meta, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        new_title  = dlg.result_title  or os.path.basename(path)
+        new_artist = dlg.result_artist
+        new_cover  = dlg.result_cover
+        new_lyrics = dlg.result_lyrics
+
+        try:
+            MetaReader.write(path, new_title, new_artist, new_cover, new_lyrics)
+        except Exception as e:
+            QMessageBox.critical(self, 'Ошибка записи', f'Не удалось сохранить теги:\n{e}')
+            return
+
+        updated_meta = TrackMeta(path=path, title=new_title, artist=new_artist,
+                                 cover=new_cover, lyrics=new_lyrics)
+        self._model.set_meta(updated_meta)
+
+        self.list_widget.item(row).setText(updated_meta.display_name)
+        if row == self._model.current_index:
+            self._show_meta(updated_meta)
 
     def delete_selected(self):
         row = self.list_widget.currentRow()
         if row < 0:
             QMessageBox.information(self, 'Удаление', 'Выберите трек для удаления.')
             return
-        path = self.playlist.pop(row)
+
+        was_current = (row == self._model.current_index)
+        self._model.remove(row)
         self.list_widget.takeItem(row)
-        self.meta_cache.pop(path, None)
-        if not self.playlist:
-            self.player.stop()
-            self.current_index = -1
+
+        if not self._model.tracks:
+            self._ctrl.stop()
             self._set_default_cover()
             return
-        if row == self.current_index:
-            self.current_index = min(row, len(self.playlist) - 1)
-            self._play_index(self.current_index)
-        elif row < self.current_index:
-            self.current_index -= 1
 
-    def _play_index(self, index: int):
-        if not (0 <= index < len(self.playlist)):
+        if was_current:
+            self._ctrl.play_index(self._model.current_index)
+
+    def _save_current_playlist_state(self):
+        self.playlists[self.current_playlist_name] = self._model.to_dict()
+
+    def _load_playlist_into_ui(self, name: str):
+        self._ctrl.stop()
+        self._thread_pool.cancel_all()
+        self.list_widget.clear()
+        self._model.clear()
+        self._set_default_cover()
+
+        data = self.playlists.get(name, {})
+        self._model.from_dict(data)
+
+        for path in self._model.tracks:
+            item = QListWidgetItem(os.path.basename(path))
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setToolTip(path)
+            self.list_widget.addItem(item)
+            self._thread_pool.submit(path, self._on_meta_ready)
+
+        if self._model.tracks:
+            self._highlight_current()
+
+        self.playlist_name_label.setText(f"▶  {name}")
+
+    def _switch_playlist(self, name: str):
+        if name == self.current_playlist_name:
             return
-        self.current_index = index
-        path = self.playlist[index]
-        if not os.path.isfile(path):
-            QMessageBox.warning(self, 'Файл не найден', f'Файл не существует:\n{path}')
-            self.delete_selected()
-            return
-        self.player.setSource(QUrl.fromLocalFile(path))
-        self.player.play()
-        self._highlight_current()
-        if path in self.meta_cache:
-            self._show_meta(self.meta_cache[path])
-            if not self.isVisible():
-                self._notify_track(self.meta_cache[path])
-        else:
-            self._set_default_cover()
+        self._save_current_playlist_state()
+        if name not in self.playlists:
+            self.playlists[name] = {"tracks": [], "current_index": -1}
+        self.current_playlist_name = name
+        self._load_playlist_into_ui(name)
 
-    def play_pause(self):
-        if not self.playlist:
-            QMessageBox.information(self, 'Пусто', 'Добавьте аудио-файлы.')
-            return
-        state = self.player.playbackState()
-        if state == QMediaPlayer.PlaybackState.PlayingState:
-            self.player.pause()
-        elif self.player.source().isEmpty():
-            self._play_index(max(self.current_index, 0))
-        else:
-            self.player.play()
+    def _rename_playlist(self, old: str, new: str):
+        if old in self.playlists:
+            self.playlists[new] = self.playlists.pop(old)
+        if self.current_playlist_name == old:
+            self.current_playlist_name = new
+            self.playlist_name_label.setText(f"▶  {new}")
 
-    def stop(self):
-        self.player.stop()
+    def _delete_playlist(self, name: str):
+        self.playlists.pop(name, None)
+        if self.current_playlist_name == name:
+            new_name = self.playlist_panel.current_name()
+            if new_name:
+                if new_name not in self.playlists:
+                    self.playlists[new_name] = {"tracks": [], "current_index": -1}
+                self.current_playlist_name = new_name
+                self._load_playlist_into_ui(new_name)
 
-    def prev_track(self):
-        if not self.playlist:
-            return
-        if self.player.position() > 2000:
-            self.player.setPosition(0)
-            return
-        if self.shuffle_mode:
-            self._play_index(self._random_index())
-        else:
-            self._play_index((self.current_index - 1) % len(self.playlist))
+    def save_playlists(self):
+        self._save_current_playlist_state()
+        SettingsManager.save(self.playlists, self.current_playlist_name)
 
-    def next_track(self):
-        if not self.playlist:
-            return
-        if self.shuffle_mode:
-            self._play_index(self._random_index())
-            return
-        if self.repeat_mode == 1:
-            self._play_index(self.current_index)
-            return
-        nxt = self.current_index + 1
-        if nxt >= len(self.playlist):
-            if self.repeat_mode == 2:
-                self._play_index(0)
-            else:
-                self.stop()
-        else:
-            self._play_index(nxt)
-
-    def _random_index(self) -> int:
-        if len(self.playlist) <= 1:
-            return 0
-        idx = random.randrange(len(self.playlist))
-        while idx == self.current_index:
-            idx = random.randrange(len(self.playlist))
-        return idx
-
-    def _seek_relative(self, ms: int):
-        pos = max(0, min(self.player.position() + ms, self.player.duration()))
-        self.player.setPosition(pos)
-
-    def _change_volume(self, delta: int):
-        self.volume_slider.setValue(max(0, min(100, self.volume_slider.value() + delta)))
-
-    def toggle_shuffle(self):
-        self.shuffle_mode = not self.shuffle_mode
-        self.shuffle_btn.setStyleSheet("background: lightgreen;" if self.shuffle_mode else "")
-
-    def toggle_repeat(self):
-        self.repeat_mode = (self.repeat_mode + 1) % 3
-        icons = ['🔁', '🔂', '🔁∞']
-        self.repeat_btn.setText(icons[self.repeat_mode])
+    def load_playlists(self):
+        self.playlists, self.current_playlist_name = SettingsManager.load()
+        self.playlist_panel.populate(list(self.playlists.keys()), self.current_playlist_name)
+        self._load_playlist_into_ui(self.current_playlist_name)
 
     def _filter_list(self, text: str):
         text = text.lower().strip()
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             path = item.data(Qt.ItemDataRole.UserRole)
-            meta = self.meta_cache.get(path)
+            meta = self._model.get_meta(path)
             haystack = (
                 (meta.title + ' ' + meta.artist).lower() if meta
                 else os.path.basename(path).lower()
@@ -1034,7 +1287,6 @@ class PyTune(QWidget):
             item.setHidden(text not in haystack)
 
     def _elide(self, label: QLabel, text: str) -> None:
-        """Устанавливает текст с обрезкой «…» по ширине лейбла."""
         fm = label.fontMetrics()
         available = max(label.width(), 100)
         elided = fm.elidedText(text, Qt.TextElideMode.ElideRight, available)
@@ -1070,13 +1322,14 @@ class PyTune(QWidget):
         self.cover_label.setPixmap(pix)
 
     def _highlight_current(self):
-        if 0 <= self.current_index < self.list_widget.count():
-            self.list_widget.setCurrentRow(self.current_index)
+        idx = self._model.current_index
+        if 0 <= idx < self.list_widget.count():
+            self.list_widget.setCurrentRow(idx)
 
     def _update_time_label(self):
         def fmt(ms): s = ms // 1000; return f"{s//60:02d}:{s%60:02d}"
         self.time_label.setText(
-            f"{fmt(self.player.position())} / {fmt(self.player.duration())}"
+            f"{fmt(self._ctrl.player.position())} / {fmt(self._ctrl.player.duration())}"
         )
 
     def _update_play_button(self, state):
@@ -1084,86 +1337,7 @@ class PyTune(QWidget):
             '⏸' if state == QMediaPlayer.PlaybackState.PlayingState else '▶'
         )
 
-    def _on_item_double_clicked(self, item: QListWidgetItem):
-        row = self.list_widget.row(item)
-        if 0 <= row < len(self.playlist):
-            self._play_index(row)
-
-    def _on_media_status(self, status):
-        if status == QMediaPlayer.MediaStatus.EndOfMedia:
-            self.next_track()
-
-    def dragEnterEvent(self, e: QDragEnterEvent):
-        if e.mimeData().hasUrls():
-            e.acceptProposedAction()
-
-    def dropEvent(self, e: QDropEvent):
-        paths = [u.toLocalFile() for u in e.mimeData().urls()]
-        self._add_paths(paths)
-
-    def _save_current_playlist_state(self):
-        """Сохраняет состояние активного плейлиста в словарь playlists."""
-        self.playlists[self.current_playlist_name] = {
-            "tracks": list(self.playlist),
-            "current_index": self.current_index,
-        }
-
-    def _load_playlist_into_ui(self, name: str):
-        """Загружает плейлист name в виджет треков."""
-        self.player.stop()
-        self.list_widget.clear()
-        self.playlist.clear()
-        self.current_index = -1
-        self._set_default_cover()
-
-        data = self.playlists.get(name, {})
-        paths = [p for p in data.get("tracks", []) if os.path.isfile(p)]
-        saved_index = data.get("current_index", -1)
-
-        for path in paths:
-            item = QListWidgetItem(os.path.basename(path))
-            item.setData(Qt.ItemDataRole.UserRole, path)
-            item.setToolTip(path)
-            self.list_widget.addItem(item)
-            self.playlist.append(path)
-            worker = MetaWorker(path, self)
-            worker.finished.connect(self._on_meta_ready)
-            worker.start()
-
-        if self.playlist:
-            self.current_index = saved_index if 0 <= saved_index < len(self.playlist) else 0
-            self._highlight_current()
-
-        self.playlist_name_label.setText(f"▶  {name}")
-
-    def _switch_playlist(self, name: str):
-        if name == self.current_playlist_name:
-            return
-        self._save_current_playlist_state()
-        if name not in self.playlists:
-            self.playlists[name] = {"tracks": [], "current_index": -1}
-        self.current_playlist_name = name
-        self._load_playlist_into_ui(name)
-
-    def _rename_playlist(self, old: str, new: str):
-        if old in self.playlists:
-            self.playlists[new] = self.playlists.pop(old)
-        if self.current_playlist_name == old:
-            self.current_playlist_name = new
-            self.playlist_name_label.setText(f"▶  {new}")
-
-    def _delete_playlist(self, name: str):
-        self.playlists.pop(name, None)
-        if self.current_playlist_name == name:
-            new_name = self.playlist_panel.current_name()
-            if new_name:
-                if new_name not in self.playlists:
-                    self.playlists[new_name] = {"tracks": [], "current_index": -1}
-                self.current_playlist_name = new_name
-                self._load_playlist_into_ui(new_name)
-
     def _make_tray_icon(self) -> QIcon:
-        """Генерирует простую иконку в виде музыкальной ноты."""
         pix = QPixmap(64, 64)
         pix.fill(Qt.GlobalColor.transparent)
         painter = QPainter(pix)
@@ -1179,7 +1353,6 @@ class PyTune(QWidget):
         return QIcon(pix)
 
     def _setup_tray(self):
-        """Создаёт иконку в системном трее с контекстным меню."""
         if not QSystemTrayIcon.isSystemTrayAvailable():
             self._tray = None
             return
@@ -1189,13 +1362,13 @@ class PyTune(QWidget):
 
         menu = QMenu()
         self._tray_play_action = menu.addAction("▶  Воспроизвести / Пауза")
-        self._tray_play_action.triggered.connect(self.play_pause)
+        self._tray_play_action.triggered.connect(self._on_play_pause_clicked)
 
         tray_next = menu.addAction("⏭  Следующий")
-        tray_next.triggered.connect(self.next_track)
+        tray_next.triggered.connect(self._ctrl.next_track)
 
         tray_prev = menu.addAction("⏮  Предыдущий")
-        tray_prev.triggered.connect(self.prev_track)
+        tray_prev.triggered.connect(self._ctrl.prev_track)
 
         menu.addSeparator()
 
@@ -1211,7 +1384,7 @@ class PyTune(QWidget):
         self._tray.activated.connect(self._on_tray_activated)
         self._tray.show()
 
-        self.player.playbackStateChanged.connect(self._update_tray_play_action)
+        self._ctrl.player.playbackStateChanged.connect(self._update_tray_play_action)
 
     def _update_tray_play_action(self, state):
         if self._tray is None:
@@ -1232,80 +1405,39 @@ class PyTune(QWidget):
 
     def _quit_app(self):
         self._tray_quit = True
+        self._thread_pool.cancel_all()
         self.save_playlists()
         if self._tray:
             self._tray.hide()
         QApplication.quit()
 
     def _notify_track(self, meta: TrackMeta):
-        """Показывает всплывающее уведомление о смене трека."""
         if self._tray is None or not self._tray.isVisible():
             return
         title = meta.title or os.path.basename(meta.path)
-        body = meta.artist if meta.artist else "Неизвестный исполнитель"
+        body  = meta.artist if meta.artist else "Неизвестный исполнитель"
         self._tray.showMessage(title, body, self._make_tray_icon(), 3000)
 
-    def save_playlists(self):
-        self._save_current_playlist_state()
-        data = {
-            "current_playlist": self.current_playlist_name,
-            "playlists": self.playlists,
-        }
-        try:
-            with open(PLAYLISTS_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=4)
-        except Exception as e:
-            print(f"[PyTune] Не удалось сохранить плейлисты: {e}")
+    def dragEnterEvent(self, e: QDragEnterEvent):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
 
-    def load_playlists(self):
-        default_name = "Плейлист 1"
-        if not os.path.exists(PLAYLISTS_FILE):
-            old_file = "playlist.json"
-            if os.path.exists(old_file):
-                try:
-                    with open(old_file, "r", encoding="utf-8") as f:
-                        old_data = json.load(f)
-                    self.playlists[default_name] = {
-                        "tracks": old_data.get("playlist", []),
-                        "current_index": old_data.get("current_index", -1),
-                    }
-                except Exception:
-                    pass
-            if not self.playlists:
-                self.playlists[default_name] = {"tracks": [], "current_index": -1}
-            self.current_playlist_name = default_name
-        else:
-            try:
-                with open(PLAYLISTS_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                self.playlists = data.get("playlists", {})
-                self.current_playlist_name = data.get("current_playlist", default_name)
-            except Exception as e:
-                print(f"[PyTune] Не удалось загрузить плейлисты: {e}")
-                self.playlists[default_name] = {"tracks": [], "current_index": -1}
-                self.current_playlist_name = default_name
-
-        if not self.playlists:
-            self.playlists[default_name] = {"tracks": [], "current_index": -1}
-            self.current_playlist_name = default_name
-        if self.current_playlist_name not in self.playlists:
-            self.current_playlist_name = next(iter(self.playlists))
-
-        self.playlist_panel.populate(list(self.playlists.keys()), self.current_playlist_name)
-        self._load_playlist_into_ui(self.current_playlist_name)
+    def dropEvent(self, e: QDropEvent):
+        paths = [u.toLocalFile() for u in e.mimeData().urls()]
+        self._add_paths(paths)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if 0 <= self.current_index < len(self.playlist):
-            path = self.playlist[self.current_index]
-            meta = self.meta_cache.get(path)
+        path = self._model.current_track
+        if path:
+            meta = self._model.get_meta(path)
             if meta:
-                title = meta.title or os.path.basename(meta.path)
-                self._elide(self.title_label, title)
+                self._elide(self.title_label, meta.title or os.path.basename(meta.path))
                 self._elide(self.artist_label, meta.artist)
 
     def closeEvent(self, event):
         if getattr(self, '_tray_quit', False) or self._tray is None:
+            self._thread_pool.cancel_all()
             self.save_playlists()
             if self._tray:
                 self._tray.hide()
