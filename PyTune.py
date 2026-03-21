@@ -54,8 +54,11 @@ class MetaWorker(QThread):
         self.path = path
 
     def run(self):
+        if self.isInterruptionRequested():
+            return
         meta = MetaReader.read(self.path)
-        self.finished.emit(meta)
+        if not self.isInterruptionRequested():
+            self.finished.emit(meta)
 
 
 class MetaReader:
@@ -232,6 +235,13 @@ class MetaReader:
                 audio['Author'] = [artist]
                 if lyrics:
                     audio['WM/Lyrics'] = [lyrics]
+                elif 'WM/Lyrics' in audio:
+                    del audio['WM/Lyrics']
+                if cover:
+                    from mutagen.asf import ASFByteArrayAttribute
+                    audio['WM/Picture'] = [ASFByteArrayAttribute(cover)]
+                elif 'WM/Picture' in audio:
+                    del audio['WM/Picture']
                 audio.save()
 
             elif ext == '.wav':
@@ -251,7 +261,7 @@ class MetaReader:
 
         except Exception as e:
             print(f"[MetaReader] Ошибка записи {path}: {e}")
-            raise
+            raise 
 
 
 class PlaylistModel:
@@ -305,7 +315,9 @@ class PlaylistModel:
         return None
 
     def random_index(self) -> int:
-        if len(self.tracks) <= 1:
+        if not self.tracks:
+            return -1
+        if len(self.tracks) == 1:
             return 0
         idx = random.randrange(len(self.tracks))
         while idx == self.current_index:
@@ -349,7 +361,6 @@ class SettingsManager:
         playlists: dict = {}
 
         if not os.path.exists(PLAYLISTS_FILE):
-            # Миграция со старого формата
             old_file = "playlist.json"
             if os.path.exists(old_file):
                 try:
@@ -405,18 +416,38 @@ class PlaybackController:
     REPEAT_ONE   = 1
     REPEAT_ALL   = 2
 
-    track_changed = None   
+    CROSSFADE_INTERVAL_MS = 50
 
     def __init__(self, model: PlaylistModel):
         self.model        = model
+        self._master_volume: float = 0.8
+
         self.player       = QMediaPlayer()
         self.audio_output = QAudioOutput()
         self.player.setAudioOutput(self.audio_output)
+
+        self._fade_player       = QMediaPlayer()
+        self._fade_audio_output = QAudioOutput()
+        self._fade_player.setAudioOutput(self._fade_audio_output)
+        self._fade_audio_output.setVolume(0.0)
 
         self.shuffle_mode: bool = False
         self.repeat_mode:  int  = self.REPEAT_OFF
 
         self.on_track_changed = None
+
+
+        self.crossfade_duration: int = 0
+        self._crossfade_active: bool = False
+        self._crossfade_triggered: bool = False
+        self._crossfade_just_finished: bool = False
+        self._crossfade_next_index: int = -1
+        self._crossfade_elapsed_ms: int = 0
+        self._crossfade_timer = QTimer()
+        self._crossfade_timer.setInterval(self.CROSSFADE_INTERVAL_MS)
+        self._crossfade_timer.timeout.connect(self._crossfade_tick)
+
+        self.player.positionChanged.connect(self._check_crossfade_trigger)
 
 
     def play_index(self, index: int):
@@ -425,11 +456,144 @@ class PlaybackController:
         path = self.model.tracks[index]
         if not os.path.isfile(path):
             return
+
+        if (self.crossfade_duration > 0
+                and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+                and not self._crossfade_active):
+            self._start_crossfade(index)
+            return
+
+        self._cancel_crossfade()
+
         self.model.current_index = index
         self.player.setSource(QUrl.fromLocalFile(path))
+        self.audio_output.setVolume(self._master_volume)
         self.player.play()
         if self.on_track_changed:
             self.on_track_changed(index)
+
+    def _check_crossfade_trigger(self, position_ms: int):
+        """Вызывается при каждом изменении позиции основного плеера."""
+        if self.crossfade_duration <= 0 or self._crossfade_active or self._crossfade_triggered:
+            return
+        if self.repeat_mode == self.REPEAT_ONE:
+            return
+        duration = self.player.duration()
+        if duration <= 0:
+            return
+        threshold_ms = self.crossfade_duration * 1000
+        if duration <= threshold_ms:
+            return
+        if position_ms >= duration - threshold_ms:
+            next_idx = self._next_index()
+            if next_idx >= 0:
+                self._crossfade_triggered = True
+                self._start_crossfade(next_idx)
+
+    def _next_index(self) -> int:
+        """Возвращает индекс следующего трека (с учётом режимов) или -1."""
+        if not self.model.tracks:
+            return -1
+        if self.shuffle_mode:
+            return self.model.random_index()
+        if self.repeat_mode == self.REPEAT_ONE:
+            return self.model.current_index
+        nxt = self.model.current_index + 1
+        if nxt >= len(self.model.tracks):
+            if self.repeat_mode == self.REPEAT_ALL:
+                return 0
+            return -1
+        return nxt
+
+    def _start_crossfade(self, next_index: int):
+        if not (0 <= next_index < len(self.model.tracks)):
+            return
+        path = self.model.tracks[next_index]
+        if not os.path.isfile(path):
+            return
+
+        self._crossfade_active = True
+        self._crossfade_next_index = next_index
+        self._crossfade_elapsed_ms = 0
+
+        self._fade_player.setSource(QUrl.fromLocalFile(path))
+        self._fade_audio_output.setVolume(0.0)
+        self._fade_player.play()
+        self._crossfade_timer.start()
+
+    def _crossfade_tick(self):
+        self._crossfade_elapsed_ms += self.CROSSFADE_INTERVAL_MS
+        total_ms = self.crossfade_duration * 1000
+        if total_ms <= 0:
+            self._finish_crossfade()
+            return
+        t = min(1.0, self._crossfade_elapsed_ms / total_ms)
+
+        self.audio_output.setVolume(self._master_volume * (1.0 - t))
+        self._fade_audio_output.setVolume(self._master_volume * t)
+
+        if t >= 1.0:
+            self._finish_crossfade()
+
+    def _finish_crossfade(self):
+        self._crossfade_timer.stop()
+
+        pos = self._fade_player.position()
+        path = self.model.tracks[self._crossfade_next_index]
+
+        self._fade_player.stop()
+        self._fade_player.setSource(QUrl())
+        self._fade_audio_output.setVolume(0.0)
+
+        self.model.current_index = self._crossfade_next_index
+        self._crossfade_active = False
+        self._crossfade_triggered = False
+        self._crossfade_just_finished = True
+        self._crossfade_next_index = -1
+
+        self.player.stop()
+        self.audio_output.setVolume(self._master_volume)
+        self.player.setSource(QUrl.fromLocalFile(path))
+
+        _FINAL_STATUSES = {
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.InvalidMedia,
+            QMediaPlayer.MediaStatus.NoMedia,
+        }
+
+        def _on_loaded(status, _pos=pos, _called=[False]):
+            if _called[0] or status not in _FINAL_STATUSES:
+                return
+            _called[0] = True
+            try:
+                self.player.mediaStatusChanged.disconnect(_on_loaded)
+            except RuntimeError:
+                pass
+            if status == QMediaPlayer.MediaStatus.LoadedMedia:
+                self.player.setPosition(_pos)
+                self.player.play()
+
+        self.player.mediaStatusChanged.connect(_on_loaded)
+
+        current_status = self.player.mediaStatus()
+        if current_status in _FINAL_STATUSES:
+            _on_loaded(current_status)
+
+        if self.on_track_changed:
+            self.on_track_changed(self.model.current_index)
+
+    def _cancel_crossfade(self):
+        if self._crossfade_active:
+            self._crossfade_timer.stop()
+            self._fade_player.stop()
+            self._fade_player.setSource(QUrl())
+            self._fade_audio_output.setVolume(0.0)
+            self._crossfade_active = False
+            self._crossfade_triggered = False
+            self._crossfade_just_finished = False
+            self._crossfade_next_index = -1
+            self._crossfade_elapsed_ms = 0
+            self.audio_output.setVolume(self._master_volume)
 
     def play_pause(self) -> bool:
         """Переключает play/pause. Возвращает True, если треки вообще есть."""
@@ -437,6 +601,7 @@ class PlaybackController:
             return False
         state = self.player.playbackState()
         if state == QMediaPlayer.PlaybackState.PlayingState:
+            self._cancel_crossfade()
             self.player.pause()
         elif self.player.source().isEmpty():
             self.play_index(max(self.model.current_index, 0))
@@ -445,6 +610,7 @@ class PlaybackController:
         return True
 
     def stop(self):
+        self._cancel_crossfade()
         self.player.stop()
 
     def next_track(self):
@@ -481,7 +647,9 @@ class PlaybackController:
         self.player.setPosition(pos)
 
     def set_volume(self, percent: int):
-        self.audio_output.setVolume(max(0, min(100, percent)) / 100)
+        self._master_volume = max(0, min(100, percent)) / 100
+        if not self._crossfade_active:
+            self.audio_output.setVolume(self._master_volume)
 
     def toggle_shuffle(self) -> bool:
         self.shuffle_mode = not self.shuffle_mode
@@ -490,6 +658,11 @@ class PlaybackController:
     def toggle_repeat(self) -> int:
         self.repeat_mode = (self.repeat_mode + 1) % 3
         return self.repeat_mode
+
+    @property
+    def is_crossfading(self) -> bool:
+        """Публичный доступ к флагу активного кроссфейда."""
+        return self._crossfade_active
 
 
 class MetaThreadPool:
@@ -517,9 +690,12 @@ class MetaThreadPool:
             pass
 
     def cancel_all(self):
-        """Запрашивает остановку всех активных потоков (best-effort)."""
+        """Запрашивает остановку всех активных потоков и дожидается их завершения."""
         for w in list(self._active):
+            w.requestInterruption()
             w.quit()
+        for w in list(self._active):
+            w.wait(500)
         self._active.clear()
 
 
@@ -810,19 +986,25 @@ class WaveformSlider(QWidget):
         self._anim_phase = 0.0
         self._anim_timer = QTimer(self)
         self._anim_timer.timeout.connect(self._tick_anim)
-        self._anim_timer.start(40)
 
     def _tick_anim(self):
-        self._anim_phase = (self._anim_phase + 0.12) % (2 * 3.14159)
+        self._anim_phase = (self._anim_phase + 0.12) % (2 * math.pi)
         self.update()
 
     def setRange(self, minimum: int, maximum: int):
         self._minimum = minimum
         self._maximum = maximum
+        if maximum <= minimum:
+            self._anim_timer.stop()
+        elif not self._anim_timer.isActive():
+            self._anim_timer.start(40)
         self.update()
 
     def setValue(self, value: int):
         self._value = value
+        if self._maximum > self._minimum:
+            if not self._anim_timer.isActive():
+                self._anim_timer.start(40)
         self.update()
 
     def value(self) -> int:
@@ -907,6 +1089,7 @@ class PyTune(QWidget):
         self._model      = PlaylistModel()
         self._ctrl       = PlaybackController(self._model)
         self._thread_pool = MetaThreadPool()
+        self._tray_quit: bool = False
 
         self._ctrl.on_track_changed = self._on_track_changed_by_ctrl
 
@@ -942,6 +1125,7 @@ class PyTune(QWidget):
         self.volume_slider.setRange(0, 100)
         self.volume_slider.setValue(80)
         self._ctrl.set_volume(80)
+        self._ctrl.crossfade_duration = 5
 
         self.time_label = QLabel('00:00 / 00:00')
 
@@ -1102,11 +1286,17 @@ class PyTune(QWidget):
 
     def _on_media_status(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
-            self._ctrl.next_track()
+            if self._ctrl._crossfade_just_finished:
+                self._ctrl._crossfade_just_finished = False
+                return
+            if not self._ctrl.is_crossfading:
+                self._ctrl.next_track()
 
     def _on_track_changed_by_ctrl(self, index: int):
         """Вызывается PlaybackController после смены трека."""
         self._highlight_current()
+        if not (0 <= index < len(self._model.tracks)):
+            return
         path = self._model.tracks[index]
         meta = self._model.get_meta(path)
         if meta:
@@ -1122,7 +1312,7 @@ class PyTune(QWidget):
     def open_files(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, 'Открыть аудио-файлы', '',
-            'Audio Files (*.mp3 *.wav *.flac *.ogg *.opus *.aac *.m4a *.wma);;All Files (*)'
+            'Audio Files (*.mp3 *.wav *.flac *.ogg *.opus *.aac *.m4a *.wma *.asf);;All Files (*)'
         )
         self._add_paths(files)
 
@@ -1198,13 +1388,20 @@ class PyTune(QWidget):
 
     def delete_selected(self):
         row = self.list_widget.currentRow()
-        if row < 0:
+        current_item = self.list_widget.item(row) if row >= 0 else None
+        if current_item is None or current_item.isHidden():
             QMessageBox.information(self, 'Удаление', 'Выберите трек для удаления.')
+            return
+
+        path = current_item.data(Qt.ItemDataRole.UserRole)
+        row = self._model.tracks.index(path) if path in self._model.tracks else -1
+        if row < 0:
             return
 
         was_current = (row == self._model.current_index)
         self._model.remove(row)
-        self.list_widget.takeItem(row)
+        list_row = self.list_widget.row(current_item)
+        self.list_widget.takeItem(list_row)
 
         if not self._model.tracks:
             self._ctrl.stop()
@@ -1297,6 +1494,7 @@ class PyTune(QWidget):
         title = meta.title or os.path.basename(meta.path)
         self._elide(self.title_label, title)
         self._elide(self.artist_label, meta.artist)
+        cover_loaded = False
         if meta.cover:
             pix = QPixmap()
             if pix.loadFromData(meta.cover):
@@ -1305,9 +1503,9 @@ class PyTune(QWidget):
                                Qt.AspectRatioMode.KeepAspectRatio,
                                Qt.TransformationMode.SmoothTransformation)
                 )
-                self.lyrics_text.setText(meta.lyrics or '')
-                return
-        self._set_default_cover_image()
+                cover_loaded = True
+        if not cover_loaded:
+            self._set_default_cover_image()
         self.lyrics_text.setText(meta.lyrics or '')
 
     def _set_default_cover(self):
@@ -1436,13 +1634,14 @@ class PyTune(QWidget):
                 self._elide(self.artist_label, meta.artist)
 
     def closeEvent(self, event):
-        if getattr(self, '_tray_quit', False) or self._tray is None:
+        if self._tray_quit or self._tray is None:
             self._thread_pool.cancel_all()
             self.save_playlists()
             if self._tray:
                 self._tray.hide()
             event.accept()
-            QApplication.quit()
+            if self._tray is None:
+                QApplication.quit()
         else:
             event.ignore()
             self.hide()
