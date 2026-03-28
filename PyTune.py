@@ -264,6 +264,160 @@ class MetaReader:
             raise 
 
 
+@dataclass
+class AppSettings:
+    crossfade_duration: int = 5
+    hotkey_play:        str = "Space"
+    hotkey_next:        str = "Ctrl+Right"
+    hotkey_prev:        str = "Ctrl+Left"
+    hotkey_seek_fwd:    str = "Right"
+    hotkey_seek_back:   str = "Left"
+    hotkey_vol_up:      str = "Up"
+    hotkey_vol_down:    str = "Down"
+
+    def to_dict(self) -> dict:
+        from dataclasses import asdict
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(d: dict) -> "AppSettings":
+        fields = {f.name for f in AppSettings.__dataclass_fields__.values()}
+        return AppSettings(**{k: v for k, v in d.items() if k in fields})
+
+
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+
+
+class AppSettingsManager:
+    @staticmethod
+    def load() -> AppSettings:
+        if not os.path.exists(SETTINGS_FILE):
+            return AppSettings()
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                return AppSettings.from_dict(json.load(f))
+        except Exception as e:
+            print(f"[AppSettingsManager] Не удалось загрузить настройки: {e}")
+            return AppSettings()
+
+    @staticmethod
+    def save(s: AppSettings):
+        try:
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(s.to_dict(), f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            print(f"[AppSettingsManager] Не удалось сохранить настройки: {e}")
+
+
+class HotkeyEdit(QLineEdit):
+    """Поле, которое перехватывает нажатие клавиши и записывает её как строку."""
+
+    def __init__(self, value: str, parent=None):
+        super().__init__(value, parent)
+        self.setReadOnly(True)
+        self.setPlaceholderText("Нажмите клавишу…")
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key.Key_unknown, Qt.Key.Key_Control,
+                   Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Meta):
+            return
+        seq = QKeySequence(int(event.modifiers()) | key).toString()
+        self.setText(seq)
+
+
+class SettingsDialog(QDialog):
+    """Диалог настроек: crossfade и горячие клавиши."""
+
+    def __init__(self, settings: AppSettings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Настройки")
+        self.setMinimumWidth(420)
+
+        self._s = settings
+
+        tabs = QTabWidget()
+
+        playback_widget = QWidget()
+        pb_form = QFormLayout(playback_widget)
+        pb_form.setSpacing(10)
+        pb_form.setContentsMargins(12, 12, 12, 12)
+
+        cf_row = QHBoxLayout()
+        self._cf_slider = QSlider(Qt.Orientation.Horizontal)
+        self._cf_slider.setRange(0, 15)
+        self._cf_slider.setValue(settings.crossfade_duration)
+        self._cf_label = QLabel(f"{settings.crossfade_duration} сек")
+        self._cf_label.setFixedWidth(46)
+        self._cf_slider.valueChanged.connect(
+            lambda v: self._cf_label.setText(f"{v} сек")
+        )
+        cf_row.addWidget(self._cf_slider)
+        cf_row.addWidget(self._cf_label)
+        pb_form.addRow("Crossfade:", cf_row)
+
+        cf_hint = QLabel("0 — crossfade отключён")
+        cf_hint.setStyleSheet("color: gray; font-size: 11px;")
+        pb_form.addRow("", cf_hint)
+
+        tabs.addTab(playback_widget, "Воспроизведение")
+
+        hk_widget = QWidget()
+        hk_form = QFormLayout(hk_widget)
+        hk_form.setSpacing(8)
+        hk_form.setContentsMargins(12, 12, 12, 12)
+
+        self._hk = {}
+        hotkeys = [
+            ("hotkey_play",      "Play / Pause"),
+            ("hotkey_next",      "Следующий трек"),
+            ("hotkey_prev",      "Предыдущий трек"),
+            ("hotkey_seek_fwd",  "Перемотка вперёд (+5 с)"),
+            ("hotkey_seek_back", "Перемотка назад (−5 с)"),
+            ("hotkey_vol_up",    "Громкость +"),
+            ("hotkey_vol_down",  "Громкость −"),
+        ]
+        for attr, label in hotkeys:
+            edit = HotkeyEdit(getattr(settings, attr))
+            self._hk[attr] = edit
+            hk_form.addRow(label + ":", edit)
+
+        reset_btn = QPushButton("Сбросить по умолчанию")
+        reset_btn.clicked.connect(self._reset_hotkeys)
+        hk_form.addRow("", reset_btn)
+
+        scroll = QScrollArea()
+        scroll.setWidget(hk_widget)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(scroll.Shape.NoFrame)
+        tabs.addTab(scroll, "Горячие клавиши")
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(tabs)
+        layout.addWidget(buttons)
+
+    def _reset_hotkeys(self):
+        defaults = AppSettings()
+        for attr, edit in self._hk.items():
+            edit.setText(getattr(defaults, attr))
+
+    @property
+    def result_settings(self) -> AppSettings:
+        s = AppSettings(
+            crossfade_duration=self._cf_slider.value(),
+        )
+        for attr, edit in self._hk.items():
+            setattr(s, attr, edit.text())
+        return s
+
+
 class PlaylistModel:
     """
     Хранит список треков, кэш метаданных и текущий индекс воспроизведения.
@@ -1090,6 +1244,7 @@ class PyTune(QWidget):
         self._ctrl       = PlaybackController(self._model)
         self._thread_pool = MetaThreadPool()
         self._tray_quit: bool = False
+        self._settings   = AppSettingsManager.load()
 
         self._ctrl.on_track_changed = self._on_track_changed_by_ctrl
 
@@ -1111,6 +1266,9 @@ class PyTune(QWidget):
         self.open_btn    = QPushButton('Открыть')
         self.delete_btn  = QPushButton('Удалить')
         self.edit_btn    = QPushButton('✏ Редактировать')
+        self.settings_btn = QPushButton('⚙')
+        self.settings_btn.setFixedWidth(32)
+        self.settings_btn.setToolTip("Настройки")
         self.prev_btn    = QPushButton('⏮')
         self.play_btn    = QPushButton('▶')
         self.stop_btn    = QPushButton('■')
@@ -1125,12 +1283,12 @@ class PyTune(QWidget):
         self.volume_slider.setRange(0, 100)
         self.volume_slider.setValue(80)
         self._ctrl.set_volume(80)
-        self._ctrl.crossfade_duration = 5
+        self._ctrl.crossfade_duration = self._settings.crossfade_duration
 
         self.time_label = QLabel('00:00 / 00:00')
 
         top_controls = QHBoxLayout()
-        for w in (self.open_btn, self.delete_btn, self.edit_btn):
+        for w in (self.open_btn, self.delete_btn, self.edit_btn, self.settings_btn):
             top_controls.addWidget(w)
         top_controls.addStretch()
         top_controls.addWidget(QLabel('Громкость'))
@@ -1208,6 +1366,7 @@ class PyTune(QWidget):
         self.open_btn.clicked.connect(self.open_files)
         self.delete_btn.clicked.connect(self.delete_selected)
         self.edit_btn.clicked.connect(self.edit_selected_meta)
+        self.settings_btn.clicked.connect(self._open_settings)
         self.play_btn.clicked.connect(self._on_play_pause_clicked)
         self.stop_btn.clicked.connect(self._ctrl.stop)
         self.prev_btn.clicked.connect(self._ctrl.prev_track)
@@ -1240,31 +1399,57 @@ class PyTune(QWidget):
         self._timer.start(500)
 
     def _setup_shortcuts(self):
-        shortcuts = {
-            Qt.Key.Key_Space:            self._on_play_pause_clicked,
-            Qt.Key.Key_MediaPlay:        self._on_play_pause_clicked,
-            Qt.Key.Key_MediaStop:        self._ctrl.stop,
-            Qt.Key.Key_MediaNext:        self._ctrl.next_track,
-            Qt.Key.Key_MediaPrevious:    self._ctrl.prev_track,
+        for sc in self.findChildren(QShortcut):
+            sc.setEnabled(False)
+            sc.deleteLater()
+
+        s = self._settings
+
+        fixed = {
+            Qt.Key.Key_MediaPlay:     self._on_play_pause_clicked,
+            Qt.Key.Key_MediaStop:     self._ctrl.stop,
+            Qt.Key.Key_MediaNext:     self._ctrl.next_track,
+            Qt.Key.Key_MediaPrevious: self._ctrl.prev_track,
+        }
+        for key, slot in fixed.items():
+            sc = QShortcut(QKeySequence(key), self)
+            sc.activated.connect(slot)
+
+        configurable = [
+            (s.hotkey_play,      self._on_play_pause_clicked),
+            (s.hotkey_next,      self._ctrl.next_track),
+            (s.hotkey_prev,      self._ctrl.prev_track),
+            (s.hotkey_seek_fwd,  lambda: self._ctrl.seek_relative(+5_000)),
+            (s.hotkey_seek_back, lambda: self._ctrl.seek_relative(-5_000)),
+            (s.hotkey_vol_up,    lambda: self.volume_slider.setValue(
+                                     min(100, self.volume_slider.value() + 5))),
+            (s.hotkey_vol_down,  lambda: self.volume_slider.setValue(
+                                     max(0, self.volume_slider.value() - 5))),
+        ]
+        for seq_str, slot in configurable:
+            if seq_str:
+                sc = QShortcut(QKeySequence(seq_str), self)
+                sc.activated.connect(slot)
+        extra = {
+            QKeySequence("Shift+Right"): lambda: self._ctrl.seek_relative(+30_000),
+            QKeySequence("Shift+Left"):  lambda: self._ctrl.seek_relative(-30_000),
             QKeySequence("Ctrl+O"):      self.open_files,
             QKeySequence("Delete"):      self.delete_selected,
             QKeySequence("Ctrl+E"):      self.edit_selected_meta,
-            QKeySequence("Right"):       lambda: self._ctrl.seek_relative(+5_000),
-            QKeySequence("Left"):        lambda: self._ctrl.seek_relative(-5_000),
-            QKeySequence("Shift+Right"): lambda: self._ctrl.seek_relative(+30_000),
-            QKeySequence("Shift+Left"):  lambda: self._ctrl.seek_relative(-30_000),
-            QKeySequence("Up"):          lambda: self.volume_slider.setValue(
-                                             min(100, self.volume_slider.value() + 5)),
-            QKeySequence("Down"):        lambda: self.volume_slider.setValue(
-                                             max(0, self.volume_slider.value() - 5)),
-            QKeySequence("Ctrl+Right"):  self._ctrl.next_track,
-            QKeySequence("Ctrl+Left"):   self._ctrl.prev_track,
             QKeySequence("Ctrl+S"):      self._on_toggle_shuffle,
             QKeySequence("Ctrl+R"):      self._on_toggle_repeat,
         }
-        for key, slot in shortcuts.items():
-            sc = QShortcut(QKeySequence(key) if isinstance(key, Qt.Key) else key, self)
+        for seq, slot in extra.items():
+            sc = QShortcut(seq, self)
             sc.activated.connect(slot)
+
+    def _open_settings(self):
+        dlg = SettingsDialog(self._settings, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._settings = dlg.result_settings
+            self._ctrl.crossfade_duration = self._settings.crossfade_duration
+            self._setup_shortcuts()
+            AppSettingsManager.save(self._settings)
 
     def _on_play_pause_clicked(self):
         if not self._ctrl.play_pause():
@@ -1494,6 +1679,11 @@ class PyTune(QWidget):
         title = meta.title or os.path.basename(meta.path)
         self._elide(self.title_label, title)
         self._elide(self.artist_label, meta.artist)
+
+        if meta.artist:
+            self.setWindowTitle(f"PyTune  ›  {meta.artist}  ›  {title}")
+        else:
+            self.setWindowTitle(f"PyTune  ›  {title}")
         cover_loaded = False
         if meta.cover:
             pix = QPixmap()
@@ -1513,6 +1703,7 @@ class PyTune(QWidget):
         self.title_label.setText("—")
         self.artist_label.setText("")
         self.lyrics_text.clear()
+        self.setWindowTitle(f"PyTune {__version__}")
 
     def _set_default_cover_image(self):
         pix = QPixmap(200, 200)
