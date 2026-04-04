@@ -418,6 +418,93 @@ class SettingsDialog(QDialog):
         return s
 
 
+class ShuffleQueue:
+    """
+    Перемешанная очередь треков.
+    При включении shuffle генерирует случайный порядок всех треков,
+    текущий трек ставится первым. Хранит позицию в очереди.
+    """
+
+    def __init__(self):
+        self._queue: list[int] = []
+        self._pos: int = -1
+
+    def build(self, track_count: int, current_index: int):
+        """Строит новую перемешанную очередь из всех треков."""
+        if track_count == 0:
+            self._queue = []
+            self._pos = -1
+            return
+        others = [i for i in range(track_count) if i != current_index]
+        random.shuffle(others)
+        if current_index >= 0:
+            self._queue = [current_index] + others
+        else:
+            self._queue = others
+        self._pos = 0
+
+    def clear(self):
+        self._queue = []
+        self._pos = -1
+
+    @property
+    def current(self) -> int:
+        """Индекс текущего трека в плейлисте или -1."""
+        if 0 <= self._pos < len(self._queue):
+            return self._queue[self._pos]
+        return -1
+
+    def next(self) -> int:
+        """Переходит к следующему треку в очереди, возвращает индекс или -1."""
+        if not self._queue:
+            return -1
+        self._pos = (self._pos + 1) % len(self._queue)
+        return self._queue[self._pos]
+
+    def prev(self) -> int:
+        """Переходит к предыдущему треку в очереди, возвращает индекс или -1."""
+        if not self._queue:
+            return -1
+        self._pos = (self._pos - 1) % len(self._queue)
+        return self._queue[self._pos]
+
+    def sync_to(self, track_index: int):
+        """Синхронизирует позицию очереди с заданным индексом трека."""
+        if track_index in self._queue:
+            self._pos = self._queue.index(track_index)
+
+    def upcoming(self, count: int = 50) -> list[int]:
+        """Возвращает список индексов треков, которые будут играть следующими."""
+        if not self._queue:
+            return []
+        start = self._pos + 1
+        result = []
+        for i in range(count):
+            idx = (start + i) % len(self._queue)
+            result.append(self._queue[idx])
+            if start + i >= len(self._queue) - 1 and len(self._queue) <= count:
+                break
+        return result
+
+    def remove_track(self, track_index: int):
+        """Удаляет трек из очереди и сдвигает индексы."""
+        new_queue = []
+        removed_before_pos = 0
+        for i, qi in enumerate(self._queue):
+            if qi == track_index:
+                if i < self._pos:
+                    removed_before_pos += 1
+                continue
+            new_queue.append(qi - 1 if qi > track_index else qi)
+        self._queue = new_queue
+        self._pos = max(0, self._pos - removed_before_pos)
+        if self._pos >= len(self._queue):
+            self._pos = 0
+
+    def __len__(self):
+        return len(self._queue)
+
+
 class PlaylistModel:
     """
     Хранит список треков, кэш метаданных и текущий индекс воспроизведения.
@@ -428,6 +515,7 @@ class PlaylistModel:
         self.tracks: list[str] = []
         self.meta_cache: dict[str, TrackMeta] = {}
         self.current_index: int = -1
+        self.shuffle_queue = ShuffleQueue()
 
     def add(self, path: str) -> bool:
         """Добавляет трек. Возвращает True, если трек был добавлен."""
@@ -442,6 +530,7 @@ class PlaylistModel:
             return None
         path = self.tracks.pop(index)
         self.meta_cache.pop(path, None)
+        self.shuffle_queue.remove_track(index)
         if not self.tracks:
             self.current_index = -1
         elif index == self.current_index:
@@ -469,6 +558,7 @@ class PlaylistModel:
         return None
 
     def random_index(self) -> int:
+        """Устаревший метод — используется только если очередь пуста."""
         if not self.tracks:
             return -1
         if len(self.tracks) == 1:
@@ -589,6 +679,7 @@ class PlaybackController:
         self.repeat_mode:  int  = self.REPEAT_OFF
 
         self.on_track_changed = None
+        self.on_queue_changed = None
 
 
         self.crossfade_duration: int = 0
@@ -625,6 +716,8 @@ class PlaybackController:
         self.player.play()
         if self.on_track_changed:
             self.on_track_changed(index)
+        if self.shuffle_mode and self.on_queue_changed:
+            self.on_queue_changed()
 
     def _check_crossfade_trigger(self, position_ms: int):
         """Вызывается при каждом изменении позиции основного плеера."""
@@ -649,7 +742,9 @@ class PlaybackController:
         if not self.model.tracks:
             return -1
         if self.shuffle_mode:
-            return self.model.random_index()
+            q = self.model.shuffle_queue
+            upcoming = q.upcoming(1)
+            return upcoming[0] if upcoming else -1
         if self.repeat_mode == self.REPEAT_ONE:
             return self.model.current_index
         nxt = self.model.current_index + 1
@@ -735,6 +830,8 @@ class PlaybackController:
 
         if self.on_track_changed:
             self.on_track_changed(self.model.current_index)
+        if self.shuffle_mode and self.on_queue_changed:
+            self.on_queue_changed()
 
     def _cancel_crossfade(self):
         if self._crossfade_active:
@@ -771,7 +868,9 @@ class PlaybackController:
         if not self.model.tracks:
             return
         if self.shuffle_mode:
-            self.play_index(self.model.random_index())
+            nxt = self.model.shuffle_queue.next()
+            if nxt >= 0:
+                self.play_index(nxt)
             return
         if self.repeat_mode == self.REPEAT_ONE:
             self.play_index(self.model.current_index)
@@ -792,7 +891,9 @@ class PlaybackController:
             self.player.setPosition(0)
             return
         if self.shuffle_mode:
-            self.play_index(self.model.random_index())
+            prv = self.model.shuffle_queue.prev()
+            if prv >= 0:
+                self.play_index(prv)
         else:
             self.play_index((self.model.current_index - 1) % len(self.model.tracks))
 
@@ -807,6 +908,14 @@ class PlaybackController:
 
     def toggle_shuffle(self) -> bool:
         self.shuffle_mode = not self.shuffle_mode
+        if self.shuffle_mode:
+            self.model.shuffle_queue.build(
+                len(self.model.tracks), self.model.current_index
+            )
+        else:
+            self.model.shuffle_queue.clear()
+        if self.on_queue_changed:
+            self.on_queue_changed()
         return self.shuffle_mode
 
     def toggle_repeat(self) -> int:
@@ -1233,6 +1342,7 @@ class WaveformSlider(QWidget):
         self.sliderMoved.emit(val)
 
 
+
 class PyTune(QWidget):
     def __init__(self):
         super().__init__()
@@ -1247,6 +1357,7 @@ class PyTune(QWidget):
         self._settings   = AppSettingsManager.load()
 
         self._ctrl.on_track_changed = self._on_track_changed_by_ctrl
+        self._ctrl.on_queue_changed = self._refresh_queue_panel
 
         self.playlists: dict           = {}
         self.current_playlist_name: str = SettingsManager.DEFAULT_NAME
@@ -1336,6 +1447,11 @@ class PyTune(QWidget):
         self.lyrics_text.setReadOnly(True)
         self.lyrics_text.setPlaceholderText("Текст песни отсутствует")
         self.tab_widget.addTab(self.lyrics_text, "Текст")
+
+        self.queue_list = QListWidget()
+        self.queue_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.queue_list.itemDoubleClicked.connect(self._on_queue_item_double_clicked)
+        self.tab_widget.addTab(self.queue_list, "Очередь")
 
         self.title_label = QLabel("—")
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1455,9 +1571,54 @@ class PyTune(QWidget):
         if not self._ctrl.play_pause():
             QMessageBox.information(self, 'Пусто', 'Добавьте аудио-файлы.')
 
+    def _refresh_queue_panel(self):
+        """Обновляет список очереди во вкладке."""
+        self.queue_list.clear()
+
+        if not self._ctrl.shuffle_mode:
+            item = QListWidgetItem("Shuffle выключен")
+            item.setForeground(QColor("gray"))
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            self.queue_list.addItem(item)
+            return
+
+        q = self._model.shuffle_queue
+        upcoming = q.upcoming(len(self._model.tracks))
+
+        fm = self.queue_list.fontMetrics()
+        available = self.queue_list.viewport().width() - 8
+
+        for rank, track_idx in enumerate(upcoming):
+            path = self._model.tracks[track_idx]
+            meta = self._model.get_meta(path)
+            display = meta.display_name if meta else os.path.basename(path)
+            full = display
+            if rank == 0:
+                display = "▶  " + display
+            elided = fm.elidedText(display, Qt.TextElideMode.ElideRight, max(available, 60))
+            list_item = QListWidgetItem(elided)
+            list_item.setData(Qt.ItemDataRole.UserRole, track_idx)
+            list_item.setToolTip(full)
+            self.queue_list.addItem(list_item)
+
+    def _on_queue_item_double_clicked(self, item: QListWidgetItem):
+        """Переходит к треку по двойному клику в панели очереди."""
+        track_idx = item.data(Qt.ItemDataRole.UserRole)
+        if track_idx is None:
+            return
+        self._model.shuffle_queue.sync_to(track_idx)
+        self._ctrl.play_index(track_idx)
+
+    def _on_meta_ready_queue_update(self, meta: TrackMeta):
+        """При загрузке метаданных обновить очередь, если она видна."""
+        self._on_meta_ready(meta)
+        if self._ctrl.shuffle_mode:
+            self._refresh_queue_panel()
+
     def _on_toggle_shuffle(self):
         active = self._ctrl.toggle_shuffle()
         self.shuffle_btn.setStyleSheet("background: lightgreen;" if active else "")
+        self._refresh_queue_panel()
 
     def _on_toggle_repeat(self):
         mode = self._ctrl.toggle_repeat()
@@ -1490,6 +1651,8 @@ class PyTune(QWidget):
                 self._notify_track(meta)
         else:
             self._set_default_cover()
+        if self._ctrl.shuffle_mode:
+            self._refresh_queue_panel()
 
     def _on_order_changed(self, new_order: list[str]):
         self._model.reorder(new_order)
@@ -1525,6 +1688,11 @@ class PyTune(QWidget):
         item.setToolTip(path)
         self.list_widget.addItem(item)
         self._thread_pool.submit(path, self._on_meta_ready)
+        if self._ctrl.shuffle_mode:
+            self._model.shuffle_queue.build(
+                len(self._model.tracks), self._model.current_index
+            )
+            self._refresh_queue_panel()
         return True
 
     def _on_meta_ready(self, meta: TrackMeta):
@@ -1538,6 +1706,8 @@ class PyTune(QWidget):
             self._show_meta(meta)
             if not self.isVisible():
                 self._notify_track(meta)
+        if self._ctrl.shuffle_mode:
+            self._refresh_queue_panel()
 
     def edit_selected_meta(self):
         row = self.list_widget.currentRow()
@@ -1823,6 +1993,8 @@ class PyTune(QWidget):
             if meta:
                 self._elide(self.title_label, meta.title or os.path.basename(meta.path))
                 self._elide(self.artist_label, meta.artist)
+        if self._ctrl.shuffle_mode:
+            self._refresh_queue_panel()
 
     def closeEvent(self, event):
         if self._tray_quit or self._tray is None:
