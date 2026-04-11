@@ -478,28 +478,30 @@ class ShuffleQueue:
         if not self._queue:
             return []
         start = self._pos + 1
-        result = []
-        for i in range(count):
-            idx = (start + i) % len(self._queue)
-            result.append(self._queue[idx])
-            if start + i >= len(self._queue) - 1 and len(self._queue) <= count:
-                break
-        return result
+        n = min(count, len(self._queue) - 1)
+        return [self._queue[(start + i) % len(self._queue)] for i in range(n)]
 
     def remove_track(self, track_index: int):
         """Удаляет трек из очереди и сдвигает индексы."""
         new_queue = []
         removed_before_pos = 0
+        removed_at_pos = False
         for i, qi in enumerate(self._queue):
             if qi == track_index:
                 if i < self._pos:
                     removed_before_pos += 1
+                elif i == self._pos:
+                    removed_at_pos = True
                 continue
             new_queue.append(qi - 1 if qi > track_index else qi)
         self._queue = new_queue
-        self._pos = max(0, self._pos - removed_before_pos)
-        if self._pos >= len(self._queue):
-            self._pos = 0
+        if not self._queue:
+            self._pos = -1
+            return
+        new_pos = self._pos - removed_before_pos
+        if removed_at_pos:
+            new_pos = min(new_pos, len(self._queue) - 1)
+        self._pos = max(0, new_pos)
 
     def __len__(self):
         return len(self._queue)
@@ -1342,7 +1344,6 @@ class WaveformSlider(QWidget):
         self.sliderMoved.emit(val)
 
 
-
 class PyTune(QWidget):
     def __init__(self):
         super().__init__()
@@ -1588,18 +1589,23 @@ class PyTune(QWidget):
         fm = self.queue_list.fontMetrics()
         available = self.queue_list.viewport().width() - 8
 
-        for rank, track_idx in enumerate(upcoming):
-            path = self._model.tracks[track_idx]
-            meta = self._model.get_meta(path)
-            display = meta.display_name if meta else os.path.basename(path)
-            full = display
-            if rank == 0:
-                display = "▶  " + display
-            elided = fm.elidedText(display, Qt.TextElideMode.ElideRight, max(available, 60))
-            list_item = QListWidgetItem(elided)
-            list_item.setData(Qt.ItemDataRole.UserRole, track_idx)
-            list_item.setToolTip(full)
-            self.queue_list.addItem(list_item)
+        def _add_queue_item(ti, prefix=""):
+            p = self._model.tracks[ti]
+            m = self._model.get_meta(p)
+            full = m.display_name if m else os.path.basename(p)
+            disp = prefix + full
+            elided = fm.elidedText(disp, Qt.TextElideMode.ElideRight, max(available, 60))
+            li = QListWidgetItem(elided)
+            li.setData(Qt.ItemDataRole.UserRole, ti)
+            li.setToolTip(full)
+            self.queue_list.addItem(li)
+
+        current_idx = q.current
+        if current_idx >= 0:
+            _add_queue_item(current_idx, "▶  ")
+
+        for track_idx in upcoming:
+            _add_queue_item(track_idx)
 
     def _on_queue_item_double_clicked(self, item: QListWidgetItem):
         """Переходит к треку по двойному клику в панели очереди."""
