@@ -1,3 +1,4 @@
+#version = 1.6.1-alpha
 import sys
 import os
 import json
@@ -713,6 +714,8 @@ class PlaybackController:
         self._cancel_crossfade()
 
         self.model.current_index = index
+        if self.shuffle_mode:
+            self.model.shuffle_queue.sync_to(index)
         self.player.setSource(QUrl.fromLocalFile(path))
         self.audio_output.setVolume(self._master_volume)
         self.player.play()
@@ -797,6 +800,8 @@ class PlaybackController:
         self._fade_audio_output.setVolume(0.0)
 
         self.model.current_index = self._crossfade_next_index
+        if self.shuffle_mode:
+            self.model.shuffle_queue.sync_to(self._crossfade_next_index)
         self._crossfade_active = False
         self._crossfade_triggered = False
         self._crossfade_just_finished = True
